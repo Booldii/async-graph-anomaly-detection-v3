@@ -176,13 +176,12 @@ def build_base_features(sent: pd.DataFrame, received: pd.DataFrame) -> pd.DataFr
         .groupby("address")
         .agg({"min": "min", "max": "max"})
     )
-    active_span_hours = ((activity["max"] - activity["min"]) / 3600).rename("active_span_hours")
     # metadata for time split (not a model feature)
     first_seen_timestamp = activity["min"].rename("first_seen_timestamp")
 
     features = pd.concat(
         [out_degree, in_degree, value_sent, value_received, gas,
-         tokens_sent, tokens_received, active_span_hours, first_seen_timestamp],
+         tokens_sent, tokens_received, first_seen_timestamp],
         axis=1,
     )
     features[["out_degree", "in_degree", "tokens_sent", "tokens_received"]] = (
@@ -292,9 +291,8 @@ def build_contract_features(
     address_index: pd.Index,
     contract_flags: pd.Series,
     all_neighbors: pd.Series,
-    labeled_addresses: set[str],
 ) -> pd.DataFrame:
-    """is_contract + share of counterparties that are contracts / have a known label"""
+    """is_contract + share of counterparties that are contracts"""
     contract_address_set = set(contract_flags[contract_flags].index)
     neighbors_aligned = all_neighbors.reindex(address_index)
 
@@ -305,9 +303,6 @@ def build_contract_features(
     features["is_contract"] = contract_flags.reindex(address_index)
     features["neighbor_contract_share"] = [
         share(_safe_set(n), contract_address_set) for n in neighbors_aligned
-    ]
-    features["neighbor_label_share"] = [
-        share(_safe_set(n), labeled_addresses) for n in neighbors_aligned
     ]
     return features
 
@@ -339,6 +334,8 @@ def build_address_features(df: pd.DataFrame, contract_flags: pd.Series) -> pd.Da
     )
     features = features.join(build_shape_and_temporal_features(sent, received), how="left")
     features["tx_per_active_day"] = features["total_degree"] / features["days_active"]
+    # days_active only exists to derive the rate above - dropped so it can't be mistaken for a usable feature
+    features = features.drop(columns=["days_active"])
 
     features = features.join(build_self_loop_features(df_graph), how="left")
     features["self_loop_count"] = features["self_loop_count"].fillna(0)
@@ -351,16 +348,15 @@ def build_address_features(df: pd.DataFrame, contract_flags: pd.Series) -> pd.Da
     )
 
     features = features.join(
-        build_contract_features(
-            features.index, contract_flags, all_neighbors, set(labels["address"])
-        ),
+        build_contract_features(features.index, contract_flags, all_neighbors),
         how="left",
     )
 
     # contracts and null/burn addresses are not the scoring target - is_contract
-    # unresolved by default is treated as an EOA
+    # unresolved by default is treated as an EOA. Used only to filter, then dropped -
+    # it's constant for every remaining row, so it can't be mistaken for a usable feature.
     features["is_contract"] = features["is_contract"].fillna(False).astype(bool)
-    features = features[~features["is_contract"]]
+    features = features[~features["is_contract"]].drop(columns=["is_contract"])
 
     features = features.join(labels.set_index("address")["label"], how="inner")
     return features
@@ -375,7 +371,7 @@ def main() -> None:
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     features.to_parquet(OUTPUT_PATH)
 
-    print(f"labeled EOA addresses in the training set: {len(features)}")
+    print(f"labeled EOAs addresses in the training set: {len(features)}")
     print(features["label"].value_counts())
     print(f"saved to: {OUTPUT_PATH}")
 
