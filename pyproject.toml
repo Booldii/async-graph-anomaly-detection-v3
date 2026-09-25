@@ -10,7 +10,9 @@ dependencies = [
     "ipykernel>=7.3.0",
     "jinja2>=3.1.6",
     "matplotlib>=3.11.2",
+    "mlflow>=3.16.1",
     "pandas>=3.0.5",
     "pyarrow>=25.0.1",
     "seaborn>=0.13.2",
+    "xgboost>=3.4.1",
 ]
