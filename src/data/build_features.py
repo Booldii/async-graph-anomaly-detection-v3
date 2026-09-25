@@ -8,7 +8,6 @@ Output: one row per EOA address (contracts and null/burn addresses excluded), "l
 NaN addresses miss the training dataset because we don't we "ground truth" for them.
 """
 
-from collections import defaultdict, deque
 from pathlib import Path
 
 import numpy as np
@@ -94,24 +93,6 @@ def add_value_zscore(df_graph: pd.DataFrame, labeled_addresses: set[str]) -> pd.
         token_mad > 0, (df_graph["log_value"] - token_median) / token_mad, 0.0
     )
     return df_graph
-
-
-def compute_hop_distances(df_graph: pd.DataFrame, fraud_addresses: set[str]) -> dict[str, int]:
-    """Multi-source BFS starting from the confirmed fraud set."""
-    adjacency: dict[str, set[str]] = defaultdict(set)
-    for a, b in zip(df_graph["from"].to_numpy(), df_graph["to"].to_numpy()):
-        adjacency[a].add(b)
-        adjacency[b].add(a)
-
-    hop_distance = {addr: 0 for addr in fraud_addresses}
-    queue = deque(fraud_addresses)
-    while queue:
-        current = queue.popleft()
-        for neighbor in adjacency[current]:
-            if neighbor not in hop_distance:
-                hop_distance[neighbor] = hop_distance[current] + 1
-                queue.append(neighbor)
-    return hop_distance
 
 
 def _safe_set(x: object) -> set:
@@ -317,9 +298,6 @@ def build_address_features(df: pd.DataFrame, contract_flags: pd.Series) -> pd.Da
     sent = df_graph.rename(columns={"from": "address"})
     received = df_graph.rename(columns={"to": "address"})
 
-    hop_distance = compute_hop_distances(
-        df_graph, set(labels.loc[labels["label"] == 1.0, "address"])
-    )
     all_neighbors, reciprocal_neighbors = build_neighbor_sets(sent, received)
 
     features = build_base_features(sent, received)
@@ -339,13 +317,6 @@ def build_address_features(df: pd.DataFrame, contract_flags: pd.Series) -> pd.Da
 
     features = features.join(build_self_loop_features(df_graph), how="left")
     features["self_loop_count"] = features["self_loop_count"].fillna(0)
-
-    features["hop_distance_to_fraud"] = (
-        features.index.to_series()
-        .map(hop_distance)
-        .fillna(-1) # fill missing values with -1 meaning "disconnected"
-        .astype(int)
-    )
 
     features = features.join(
         build_contract_features(features.index, contract_flags, all_neighbors),
