@@ -1,22 +1,33 @@
 """
-Builds a feature table per EOA address for XGBoost training.
+Builds a feature table per EOA address, either for XGBoost training (build_address_features,
+labeled historical data) or for label scoring (build_address_features_for_scoring, fresh
+unlabeled data - no from_label/to_label columns at all).
 
 Input: Token transfers DataFrame in standard schema (hash/from/to/value/
-timeStamp/tokenSymbol/contractAddress/gasPrice/gasUsed/gasFee/from_label/to_label)
+timeStamp/tokenSymbol/contractAddress/gasPrice/gasUsed/gasFee[/from_label/to_label])
 
-Output: one row per EOA address (contracts and null/burn addresses excluded), "label" column (0/1) -
-NaN addresses miss the training dataset because we don't we "ground truth" for them.
+Training output: one row per EOA address with a confirmed label column (0/1).
+Scoring output: one row per EOA address in the input - no label column, since none exists.
+Both exclude contracts and null/burn addresses.
 """
 
+import argparse
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# training mode:
 RAW_DATA_PATH = PROJECT_ROOT / "data" / "raw" / "bybit_ec_all14days_Tx.parquet"
 CONTRACT_FLAGS_PATH = PROJECT_ROOT / "data" / "interim" / "bybit_address_contract_flags.parquet"
 OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "bybit_address_features.parquet"
+
+# scoring mode:
+FRESH_SAMPLE_PATH = PROJECT_ROOT / "data" / "interim" / "eth_fresh_sample.parquet"
+FRESH_CONTRACT_FLAGS_PATH = PROJECT_ROOT / "data" / "interim" / "eth_fresh_address_contract_flags.parquet"
+SCORING_OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "eth_fresh_sample_features.parquet"
 
 NULL_ADDRESSES = {
     "0x0000000000000000000000000000000000000000",
@@ -60,7 +71,10 @@ def add_value_zscore(df_graph: pd.DataFrame, labeled_addresses: set[str]) -> pd.
     in this dataset touch a labeled address. By calculating the reference on the whole population, we would measure
     "how unusual relative to typical hack activity", not relative to normal traffic - which is
     the exact opposite reference of what a fresh pull from BQ will have (where background will probably dominate).
-    Contracts without any background get a fallback: a reference calculated on the entire population."""
+    Contracts without any background get a fallback: a reference calculated on the entire population.
+
+    The scoring case: labeled_addresses=set() makes every row background: fresh data has no ground truth at all,
+    so the whole population genuinely is what this function calls background"""
     df_graph = df_graph.copy()
     df_graph["log_value"] = np.log1p(df_graph["value"])
 
@@ -288,12 +302,13 @@ def build_contract_features(
     return features
 
 
-def build_address_features(df: pd.DataFrame, contract_flags: pd.Series) -> pd.DataFrame:
-    """Orchestrates all feature groups. Returns a training set: one row per EOA address with
-    a confirmed label 0/1 - contracts, null/burn addresses, and unlabeled addrsses are excluded."""
+def _build_address_features_core(
+    df: pd.DataFrame, contract_flags: pd.Series, labeled_addresses: set[str]
+) -> pd.DataFrame:
+    """Orchestrates all feature groups, shared by both training and scoring mode. Returns one
+    row per EOA address - contracts and null/burn addresses excluded. No label attached here."""
     df_graph, mint_burn_rows = split_graph_and_mint_burn(df)
-    labels = build_address_labels(df)
-    df_graph = add_value_zscore(df_graph, set(labels["address"]))
+    df_graph = add_value_zscore(df_graph, labeled_addresses)
 
     sent = df_graph.rename(columns={"from": "address"})
     received = df_graph.rename(columns={"to": "address"})
@@ -329,22 +344,56 @@ def build_address_features(df: pd.DataFrame, contract_flags: pd.Series) -> pd.Da
     features["is_contract"] = features["is_contract"].fillna(False).astype(bool)
     features = features[~features["is_contract"]].drop(columns=["is_contract"])
 
-    features = features.join(labels.set_index("address")["label"], how="inner")
     return features
 
 
+def build_address_features(df: pd.DataFrame, contract_flags: pd.Series) -> pd.DataFrame:
+    """Training mode: Returns one row per EOA address with a confirmed label 0/1 - unlabeled
+    addresses are excluded, since there's no ground truth to train on for them."""
+    labels = build_address_labels(df)
+    features = _build_address_features_core(df, contract_flags, set(labels["address"]))
+    return features.join(labels.set_index("address")["label"], how="inner")
+
+
+def build_address_features_for_scoring(df: pd.DataFrame, contract_flags: pd.Series) -> pd.DataFrame:
+    """Scoring mode: df has no from_label/to_label columns at all - there's no seed set of known addresses,
+    so the entire population is passed as the "background" reference to add_value_zscore. Returns one row per EOA address"""
+    return _build_address_features_core(df, contract_flags, labeled_addresses=set())
+
+
 def main() -> None:
-    df = load_raw_transfers(RAW_DATA_PATH)
-    contract_flags = pd.read_parquet(CONTRACT_FLAGS_PATH).set_index("address")["is_contract"]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=["train", "score"],
+        default="train",
+        help="train: historical labeled data -> bybit_address_features.parquet, with a label "
+        "column (default). score: fresh sampled data (sample_fresh_addresses.py's output) -> "
+        "eth_fresh_sample_features.parquet, no label column",
+    )
+    args = parser.parse_args()
 
-    features = build_address_features(df, contract_flags)
+    if args.mode == "train":
+        df = load_raw_transfers(RAW_DATA_PATH)
+        contract_flags = pd.read_parquet(CONTRACT_FLAGS_PATH).set_index("address")["is_contract"]
+        features = build_address_features(df, contract_flags)
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    features.to_parquet(OUTPUT_PATH)
+        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        features.to_parquet(OUTPUT_PATH)
 
-    print(f"labeled EOAs addresses in the training set: {len(features)}")
-    print(features["label"].value_counts())
-    print(f"saved to: {OUTPUT_PATH}")
+        print(f"labeled EOAs addresses in the training set: {len(features)}")
+        print(features["label"].value_counts())
+        print(f"saved to: {OUTPUT_PATH}")
+    else:
+        df = load_raw_transfers(FRESH_SAMPLE_PATH)
+        contract_flags = pd.read_parquet(FRESH_CONTRACT_FLAGS_PATH).set_index("address")["is_contract"]
+        features = build_address_features_for_scoring(df, contract_flags)
+
+        SCORING_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        features.to_parquet(SCORING_OUTPUT_PATH)
+
+        print(f"scored EOA addresses: {len(features)}")
+        print(f"saved to: {SCORING_OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
