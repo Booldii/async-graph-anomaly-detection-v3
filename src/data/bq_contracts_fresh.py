@@ -3,7 +3,7 @@ Checks which addresses from the fresh BigQuery pull (data/raw/eth_fresh_*.parque
 deployed smart contracts, analogous to bq_contracts.py for the historical ByBit dataset.
 
 Why a separate script instead of reusing bq_contracts.py: that script passes the address
-list inline as an ArrayQueryParameter. That works for the historical dataset's with 59k addresses,
+list inline as an ArrayQueryParameter. That works for the historical dataset's ~59k addresses,
 but the fresh pull has above 8M distinct addresses - a literal array that size would blow
 past BigQuery's request-size limit (~10MB) long before it got anywhere near billing.
 The fix is a JOIN against a scratch table instead of an inline array,
@@ -15,17 +15,17 @@ addresses seen exclusively as from/to actually need checking.
 """
 
 import argparse
-import re
 from pathlib import Path
 
 import pandas as pd
 from google.cloud import bigquery
 
+from find_fresh_pull import find_latest_fresh_path
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
 OUTPUT_PATH = PROJECT_ROOT / "data" / "interim" / "eth_fresh_address_contract_flags.parquet"
 
-FRESH_FILENAME_RE = re.compile(r"eth_fresh_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.parquet$")
 CONTRACTS_TABLE = "bigquery-public-data.crypto_ethereum.contracts"
 SCRATCH_TABLE_EXPIRATION_HOURS = 1
 
@@ -42,21 +42,6 @@ ON ua.address = c.address
 """
 
 
-def find_latest_fresh_path(raw_dir: Path = RAW_DATA_DIR) -> Path:
-    """Picks the eth_fresh_<start>_<end>.parquet file with the latest end date"""
-    candidates = []
-    for path in raw_dir.glob("eth_fresh_*.parquet"):
-        match = FRESH_FILENAME_RE.search(path.name)
-        if match:
-            candidates.append((match.group(2), path))
-
-    if not candidates:
-        raise FileNotFoundError(f"no eth_fresh_<start>_<end>.parquet files found in {raw_dir}")
-
-    candidates.sort(key=lambda c: c[0])
-    return candidates[-1][1]
-
-
 def estimate_cost(client: bigquery.Client) -> None:
     """Dry-runs a full scan of contracts.address - the dominant cost component of the real JOIN"""
     job_config = bigquery.QueryJobConfig(dry_run=True)
@@ -64,7 +49,7 @@ def estimate_cost(client: bigquery.Client) -> None:
     bytes_processed = query_job.total_bytes_processed
     gb = bytes_processed / 1e9
     print(f"[dry-run, proxy] scanning {CONTRACTS_TABLE}.address: {gb:.2f} GB")
-    print("[dry-run] this is a stand-in for the real JOIN cost")
+    print("[dry-run] this is a stand-in for the real JOIN's cost")
 
 def load_address_universe(fresh_path: Path) -> tuple[pd.DataFrame, set[str]]:
     """Returns: addresses needing a BigQuery lookup, addresses already known"""
@@ -115,7 +100,7 @@ def main() -> None:
     parser.add_argument("--scratch-table", default="address_universe_fresh", help="name of the temporary address table")
     args = parser.parse_args()
 
-    fresh_path = find_latest_fresh_path()
+    fresh_path = find_latest_fresh_path(RAW_DATA_DIR)
     print(f"using latest fresh pull: {fresh_path.name}")
 
     client = bigquery.Client(project=args.project)
