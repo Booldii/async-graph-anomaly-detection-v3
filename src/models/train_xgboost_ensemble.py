@@ -18,6 +18,7 @@ validation on the later part. Limitation: features in build_features.py are calc
 over the entire 14-day window.
 """
 
+import argparse
 import re
 from pathlib import Path
 
@@ -129,18 +130,40 @@ def family_shap_report(model: xgb.XGBClassifier, X: pd.DataFrame, top_n: int = 3
     return (share / share.sum()).sort_values(ascending=False).head(top_n)
 
 
-def main() -> None:
-    MLFLOW_TRACKING_DIR.mkdir(parents=True, exist_ok=True)
-    mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_TRACKING_DIR / 'mlflow.db'}")
-    if mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME) is None:
-        mlflow.create_experiment(
-            MLFLOW_EXPERIMENT_NAME,
-            artifact_location=(MLFLOW_TRACKING_DIR / "artifacts").as_uri(),
-        )
-    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+def train_full_data(df: pd.DataFrame) -> None:
+    """Trains the final production ensemble on the entire labeled dataset.
+    The point here is to use every available label for the model that will actually score fresh
+    data. Skips diagnostics that need a validation set. SHAP concentration is still reported."""
+    y = df["label"]
+    print(f"training on full dataset: {len(df)} addresses (fraud {y.mean():.1%})\n")
 
-    df = load_features()
-    check_families_cover_features(df)
+    with mlflow.start_run():
+        mlflow.set_tag("final_model", "true")
+        mlflow.log_params(MODEL_PARAMS)
+        for family, feats in FEATURE_FAMILIES.items():
+            mlflow.log_param(f"features_{family}", feats)
+        mlflow.log_metric("n_train", len(df))
+        mlflow.log_metric("fraud_rate_train", y.mean())
+
+        models: dict[str, xgb.XGBClassifier] = {}
+        for family, feats in FEATURE_FAMILIES.items():
+            models[family] = train_model(df[feats], y)
+            mlflow.xgboost.log_model(models[family], name=f"xgb_family_{family}")
+
+        print("[SHAP concentration within family - on training data]")
+        for family, feats in FEATURE_FAMILIES.items():
+            top = family_shap_report(models[family], df[feats])
+            print(f"{family}: " + ", ".join(f"{k}={v:.2f}" for k, v in top.items()))
+            for feat_name, share in top.items():
+                mlflow.log_metric(f"shap_{family}_{feat_name}", share)
+
+        print(
+            f"\nfinal production models logged to MLflow: {MLFLOW_TRACKING_DIR} "
+            f"(experiment: {MLFLOW_EXPERIMENT_NAME}, tag final_model=true)"
+        )
+
+
+def train_with_validation(df: pd.DataFrame) -> None:
     train_df, val_df = time_based_split(df)
     y_train, y_val = train_df["label"], val_df["label"]
     print(
@@ -232,6 +255,36 @@ def main() -> None:
                 f"{max_share:.1%} of consensus sensitivity (> {MAX_FAMILY_LOO_SHARE:.0%} "
                 "threshold) - one family dominates the ensemble, defeating its purpose"
             )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--full-data",
+        action="store_true",
+        help="train on the entire labeled dataset , tag the run final_model=true "
+        "Use the default (no flag) run to validate the ensemble methodology."
+        "Use this run's models for actually scoring fresh data.",
+    )
+    args = parser.parse_args()
+
+    MLFLOW_TRACKING_DIR.mkdir(parents=True, exist_ok=True)
+    mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_TRACKING_DIR / 'mlflow.db'}")
+    if mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME) is None:
+        mlflow.create_experiment(
+            MLFLOW_EXPERIMENT_NAME,
+            artifact_location=(MLFLOW_TRACKING_DIR / "artifacts").as_uri(),
+        )
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+
+    df = load_features()
+    check_families_cover_features(df)
+
+    if args.full_data:
+        train_full_data(df)
+    else:
+        train_with_validation(df)
+
 
 if __name__ == "__main__":
     main()
