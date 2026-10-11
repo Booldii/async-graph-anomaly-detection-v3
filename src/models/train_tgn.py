@@ -1,6 +1,6 @@
 """
 Trains a Temporal Graph Network (TGN) on the sampled fresh transfer graph
-(build_temporal_graph.py's output), using the per-event soft labels as the regression target.
+(build_temporal_graph.py's output) using the per-event soft labels as the regression target.
 
 Architecture: PyTorch Geometric's reference TGN (memory module with a GRU-based updater + a
 graph-attention embedding module over a bounded recent-neighbor window), adapted for node-level
