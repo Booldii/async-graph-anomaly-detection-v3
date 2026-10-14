@@ -16,5 +16,8 @@ wheels/
 # MLFLow artefacts
 mlruns/
 
+# .env keys
+.env
+
 
 
