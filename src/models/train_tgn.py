@@ -216,6 +216,15 @@ def main() -> None:
                 "gnn": gnn.state_dict(),
                 "risk_head": risk_head.state_dict(),
                 "node_index": checkpoint["node_index"],
+                # LastNeighborLoader is a plain class, rather than a nn.Module,
+                # so it has no state_dict() at all. Without this, Stage 3 would know each
+                # address's memory values but not who its most recent neighbors actually were,
+                # which is required by graph's attention step.
+                "neighbor_loader": {
+                    "neighbors": neighbor_loader.neighbors,
+                    "e_id": neighbor_loader.e_id,
+                    "cur_e_id": neighbor_loader.cur_e_id,
+                },
             },
             CHECKPOINT_PATH,
         )
