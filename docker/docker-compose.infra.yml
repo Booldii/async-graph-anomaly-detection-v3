@@ -1,0 +1,71 @@
+# Stage 3 stateful infrastructure: one Redpanda broker (used as the event bus between chain_listener.py
+# and inference_consumer.py) + one Redis instance (TGN memory snapshot backup + last risk score per
+# address). Split from the stateless compute services (chain_listener/inference_consumer containers,
+# docker-compose.app.yml): this stack holds the data volumes and is started once per work session,
+# while the app stack gets rebuilt/restarted repeatedly during development - keeping them in one file
+# would mean every --build iteration also re-touches redpanda and redis for no reason.
+
+networks:
+  default:
+    name: onchain-net
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --mode
+      - dev-container
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: creates the transfers topic with exactly 1 partition. TGN memory updates
+  # for a given address are a stateful, order-dependent sequence - more than 1 partition
+  # could let a consumer group process two updates for the same address out of the order
+  # they actually happened on-chain.
+  topic-init:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint:
+      - rpk
+      - topic
+      - create
+      - eth-transfers
+      - --partitions
+      - "1"
+      - --replicas
+      - "1"
+      - --brokers
+      - redpanda:9092
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  redpanda-data:
+  redis-data:
