@@ -1,7 +1,8 @@
 """
 Connects to Ethereum Mainnet over a persistent WebSocket (Alchemy) and subscribes to all
 ERC-20 Transfer logs network-wide. Decodes and normalizes each log into the same row shape produced
-by src/data/bq_fetch_day.py, then publishes it downstream.
+by src/data/bq_fetch_day.py, then publishes it downstream to the Redpanda broker started by
+docker-compose.infra.yml
 
 Known MVP limitation: the reconnect/backfill logic below only covers gaps from a WebSocket
 drop within one process lifetime. last_processed_block is in-memory only - a full process
@@ -12,15 +13,12 @@ import asyncio
 import json
 import logging
 import os
-from pathlib import Path
 
-from dotenv import load_dotenv
+from aiokafka import AIOKafkaProducer
+from common import KAFKA_BOOTSTRAP_SERVERS, TOPIC_TRANSFERS
 from eth_typing import ChecksumAddress
 from web3 import AsyncWeb3, WebSocketProvider
 from web3.types import FilterParams, LogReceipt
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(PROJECT_ROOT / ".env")
 
 ALCHEMY_API_KEY = os.environ["ALCHEMY_API_KEY"]
 WS_URL = f"wss://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
@@ -140,9 +138,10 @@ async def normalize_log(
     }
 
 
-def publish(row: dict) -> None:
-    # TODO: swap for a Redpanda producer once docker stands
-    print(json.dumps(row))
+async def publish(producer: AIOKafkaProducer, row: dict) -> None:
+    # The broker is Redpanda,  which speaks the Kafka wire protocol,
+    # so any standard Kafka client library works against it unmodified.
+    await producer.send_and_wait(TOPIC_TRANSFERS, json.dumps(row).encode("utf-8"))
 
 
 async def backfill(
@@ -151,6 +150,7 @@ async def backfill(
     decimals_cache: TokenDecimalsCache,
     block_ts_cache: BoundedFifoCache,
     gas_cache: BoundedFifoCache,
+    producer: AIOKafkaProducer,
 ) -> None:
     to_block = await w3.eth.block_number
     if from_block > to_block:
@@ -165,7 +165,7 @@ async def backfill(
     for log in logs:
         row = await normalize_log(w3, log, decimals_cache, block_ts_cache, gas_cache)
         if row is not None:
-            publish(row)
+            await publish(producer, row)
     logger.info("backfill done: %d logs replayed", len(logs))
 
 
@@ -175,34 +175,41 @@ async def run() -> None:
     gas_cache = BoundedFifoCache(maxsize=4096)
     last_processed_block: int | None = None
 
-    while True:
-        try:
-            async with AsyncWeb3(WebSocketProvider(WS_URL)) as w3:
+    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+    await producer.start()
+    try:
+        while True:
+            try:
+                async with AsyncWeb3(WebSocketProvider(WS_URL)) as w3:
 
-                async def handler(ctx) -> None:
-                    nonlocal last_processed_block
-                    last_processed_block = ctx.result["blockNumber"]
-                    row = await normalize_log(
-                        ctx.async_w3, ctx.result, decimals_cache, block_ts_cache, gas_cache
-                    )
-                    if row is not None:
-                        publish(row)
+                    async def handler(ctx) -> None:
+                        nonlocal last_processed_block
+                        last_processed_block = ctx.result["blockNumber"]
+                        row = await normalize_log(
+                            ctx.async_w3, ctx.result, decimals_cache, block_ts_cache, gas_cache
+                        )
+                        if row is not None:
+                            await publish(producer, row)
 
-                # Subscribe before backfilling: any log for a block mined while backfill()
-                # runs is still queued by the provider and handled once we start draining
-                # below, so nothing is missed. The backfill range can overlap by a block or
-                # two with what the live subscription also delivers - tolerated as harmless
-                # duplicates rather than engineered away
-                await w3.eth.subscribe("logs", {"topics": [TRANSFER_EVENT_TOPIC]}, handler=handler)
-                logger.info("subscribed to Transfer logs")
+                    # Subscribe before backfilling: any log for a block mined while backfill()
+                    # runs is still queued by the provider and handled once we start draining
+                    # below, so nothing is missed. The backfill range can overlap by a block or
+                    # two with what the live subscription also delivers - tolerated as harmless
+                    # duplicates rather than engineered away
+                    await w3.eth.subscribe("logs", {"topics": [TRANSFER_EVENT_TOPIC]}, handler=handler)
+                    logger.info("subscribed to Transfer logs")
 
-                if last_processed_block is not None:
-                    await backfill(w3, last_processed_block, decimals_cache, block_ts_cache, gas_cache)
+                    if last_processed_block is not None:
+                        await backfill(
+                            w3, last_processed_block, decimals_cache, block_ts_cache, gas_cache, producer
+                        )
 
-                await w3.subscription_manager.handle_subscriptions(run_forever=True)
-        except Exception:
-            logger.exception("connection lost, reconnecting in %ds...", RECONNECT_BACKOFF_SECONDS)
-            await asyncio.sleep(RECONNECT_BACKOFF_SECONDS)
+                    await w3.subscription_manager.handle_subscriptions(run_forever=True)
+            except Exception:
+                logger.exception("connection lost, reconnecting in %ds...", RECONNECT_BACKOFF_SECONDS)
+                await asyncio.sleep(RECONNECT_BACKOFF_SECONDS)
+    finally:
+        await producer.stop()
 
 
 if __name__ == "__main__":
