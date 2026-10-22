@@ -5,17 +5,16 @@ memory -> gnn -> RiskHead, delta vs the previous score in Redis, alert if the de
 ALERT_THRESHOLD, write the new score back to Redis.
 
 State ownership: the TGN memory tensor lives in this process, as one big tensor - exactly like
-Stage 2 training. Redis only holds (1) the last risk score per address, and (2 - to implement later on)
-a periodic backup snapshot of the in-process memory/neighbor state so a restart doesn't start from zero.
+Stage 2 training. Redis only holds (1) the last risk score per address, and (2) a periodic backup snapshot of the in-process memory/neighbor/edge-feature state. The learned weights never
+change at inference time, so they always load fresh from the Stage 2 checkpoint regardless of
+whether a snapshot is used for the mutable runtime state.
 
 Cold-start: the checkpoint only has memory slots for the ~224k addresses seen during previous Stages.
 COLD_START_RESERVED_SLOTS reserves extra, zero-initialized slots beyond that for addresses never seen before.
-
-NOT YET IMPLEMENTED in this pass: the periodic Redis snapshot. This file currently always cold-boots runtime
-state from the Stage 2 checkpoint - restarting the process loses any cold-started addresses and all score history.
 """
 
 import asyncio
+import io
 import json
 import logging
 import math
@@ -61,6 +60,9 @@ NULL_ADDRESSES = {
 ALERT_THRESHOLD = 0.25
 
 REDIS_SCORE_KEY_PREFIX = "tgn:score:"
+REDIS_SNAPSHOT_KEY = "tgn:snapshot"
+# every 2000 events: frequent enough that a crash loses little ground
+SNAPSHOT_EVERY_N_EVENTS = 2000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("inference_consumer")
@@ -109,6 +111,12 @@ class EdgeFeatureStore:
     def lookup(self, e_id: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self._t[e_id], self._msg[e_id]
 
+    def snapshot(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Everything accumulated so far (historical prefix + whatever was appended during this
+        process's lifetime) - the same shape __init__ expects, so a restore just re-seeds a new
+        instance from this instead of from the Stage 2 training graph."""
+        return self._t[: self._len].clone(), self._msg[: self._len].clone()
+
 
 class InferenceState:
     """Bundles the mutable runtime state carried across every event - everything here either
@@ -138,14 +146,23 @@ class InferenceState:
         self.assoc = torch.empty(total_capacity, dtype=torch.long, device=device)
 
 
-def load_inference_state(device: torch.device) -> InferenceState:
+def load_inference_state(device: torch.device, snapshot: dict | None) -> InferenceState:
+    """snapshot, when given (from try_restore_snapshot), is a prior run's full runtime state -
+    restored 1:1 at the same total_capacity it was saved at. Without one, cold-boots from the Stage 2
+    checkpoint as before."""
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
-    graph_checkpoint = torch.load(GRAPH_PATH, map_location=device, weights_only=False)
-    historical_data = graph_checkpoint["data"]
 
-    node_index: dict[str, int] = dict(checkpoint["node_index"])
-    original_num_nodes = len(node_index)
-    total_capacity = original_num_nodes + COLD_START_RESERVED_SLOTS
+    if snapshot is not None:
+        node_index: dict[str, int] = dict(snapshot["node_index"])
+        next_cold_start_id = snapshot["next_cold_start_id"]
+        # Always derived from the original Stage 2 checkpoint's node count - the reserved-slots
+        # buffer size is a fixed constant, stable across restarts regardless of how many addresses
+        # got cold-started since.
+        total_capacity = len(checkpoint["node_index"]) + COLD_START_RESERVED_SLOTS
+    else:
+        node_index = dict(checkpoint["node_index"])
+        next_cold_start_id = len(node_index)
+        total_capacity = len(node_index) + COLD_START_RESERVED_SLOTS
 
     memory = TGNMemory(
         total_capacity,
@@ -155,19 +172,36 @@ def load_inference_state(device: torch.device) -> InferenceState:
         message_module=IdentityMessage(MSG_DIM, MEMORY_DIM, TIME_DIM),
         aggregator_module=LastAggregator(),
     ).to(device)
-    # memory/last_update/_assoc are sized by num_nodes, so they can't be loaded directly into a
-    # module constructed with a larger (expanded) num_nodes - load everything else (GRU/
-    # time_enc weights, fixed-size regardless of num_nodes) normally, then manually copy the
-    # known addresses' memory/last_update into the first original_num_nodes rows, leaving the
-    # reserved cold-start rows at their fresh zero-initialized default.
-    mem_state = dict(checkpoint["memory"])
-    saved_memory = mem_state.pop("memory")
-    saved_last_update = mem_state.pop("last_update")
-    mem_state.pop("_assoc", None)
-    memory.load_state_dict(mem_state, strict=False)
-    with torch.no_grad():
-        memory.memory[:original_num_nodes] = saved_memory.to(device)
-        memory.last_update[:original_num_nodes] = saved_last_update.to(device)
+    # TGNMemory overrides train()/eval(): the first train->eval transition flushes the message
+    # store into memory via an extra GRU pass. A freshly constructed module defaults to
+    # self.training=True, so calling eval() after loading real memory values below would silently
+    # overwrite them with that flush's output. Call eval() now, while the message store is still
+    # empty and the memory buffer is still all zeros - the flush is then a harmless no-op,
+    # immediately superseded by the real values assigned below.
+    memory.eval()
+
+    if snapshot is not None:
+        # GRU/time_enc weights still come from the checkpoint (static) - only memory/last_update
+        # content is the snapshot's, and it's already sized to total_capacity - direct assign.
+        memory.load_state_dict({k: v for k, v in checkpoint["memory"].items() if k not in ("memory", "last_update", "_assoc")}, strict=False)
+        with torch.no_grad():
+            memory.memory[:] = snapshot["memory"].to(device)
+            memory.last_update[:] = snapshot["last_update"].to(device)
+    else:
+        # memory/last_update/_assoc are sized by num_nodes, so they can't be loaded directly
+        # into a module constructed with a larger (expanded) num_nodes - load everything else
+        # (GRU/time_enc weights, fixed-size regardless of num_nodes) normally, then manually
+        # copy the known addresses' memory/last_update into the first original_num_nodes rows,
+        # leaving the reserved cold-start rows at their fresh zero-initialized default.
+        original_num_nodes = len(node_index)
+        mem_state = dict(checkpoint["memory"])
+        saved_memory = mem_state.pop("memory")
+        saved_last_update = mem_state.pop("last_update")
+        mem_state.pop("_assoc", None)
+        memory.load_state_dict(mem_state, strict=False)
+        with torch.no_grad():
+            memory.memory[:original_num_nodes] = saved_memory.to(device)
+            memory.last_update[:original_num_nodes] = saved_last_update.to(device)
 
     gnn = GraphAttentionEmbedding(
         in_channels=MEMORY_DIM, out_channels=EMBEDDING_DIM, msg_dim=MSG_DIM, time_enc=memory.time_enc
@@ -177,27 +211,38 @@ def load_inference_state(device: torch.device) -> InferenceState:
     risk_head = RiskHead(in_channels=EMBEDDING_DIM).to(device)
     risk_head.load_state_dict(checkpoint["risk_head"])
 
-    memory.eval()
     gnn.eval()
     risk_head.eval()
 
     neighbor_loader = LastNeighborLoader(total_capacity, size=NEIGHBOR_SIZE, device=device)
-    nl_state = checkpoint["neighbor_loader"]
-    neighbor_loader.neighbors[:original_num_nodes] = nl_state["neighbors"].to(device)
-    neighbor_loader.e_id[:original_num_nodes] = nl_state["e_id"].to(device)
-    neighbor_loader.cur_e_id = nl_state["cur_e_id"]
+    if snapshot is not None:
+        neighbor_loader.neighbors[:] = snapshot["neighbors"].to(device)
+        neighbor_loader.e_id[:] = snapshot["e_id"].to(device)
+        neighbor_loader.cur_e_id = snapshot["cur_e_id"]
+        edge_store = EdgeFeatureStore(snapshot["edge_t"].to(device), snapshot["edge_msg"].to(device))
+        logger.info(
+            "restored runtime state from Redis snapshot: %d addresses (incl. cold-started), "
+            "%d historical+live edges",
+            len(node_index), snapshot["edge_t"].size(0),
+        )
+    else:
+        nl_state = checkpoint["neighbor_loader"]
+        neighbor_loader.neighbors[:original_num_nodes] = nl_state["neighbors"].to(device)
+        neighbor_loader.e_id[:original_num_nodes] = nl_state["e_id"].to(device)
+        neighbor_loader.cur_e_id = nl_state["cur_e_id"]
 
-    edge_store = EdgeFeatureStore(historical_data.t.to(device), historical_data.msg.to(device))
+        graph_checkpoint = torch.load(GRAPH_PATH, map_location=device, weights_only=False)
+        historical_data = graph_checkpoint["data"]
+        edge_store = EdgeFeatureStore(historical_data.t.to(device), historical_data.msg.to(device))
+        logger.info(
+            "loaded checkpoint cold (no Redis snapshot found): %d known addresses, %d reserved "
+            "cold-start slots, %d historical edges",
+            original_num_nodes, COLD_START_RESERVED_SLOTS, historical_data.t.size(0),
+        )
 
-    logger.info(
-        "loaded checkpoint: %d known addresses, %d reserved cold-start slots, %d historical edges",
-        original_num_nodes,
-        COLD_START_RESERVED_SLOTS,
-        historical_data.t.size(0),
-    )
     return InferenceState(
         memory, gnn, risk_head, neighbor_loader, edge_store, node_index,
-        next_cold_start_id=original_num_nodes, total_capacity=total_capacity, device=device,
+        next_cold_start_id=next_cold_start_id, total_capacity=total_capacity, device=device,
     )
 
 
@@ -270,12 +315,45 @@ async def handle_score(redis_client: aioredis.Redis, address: str, new_score: fl
     await redis_client.set(key, str(new_score))
 
 
-async def consume_loop(state: InferenceState, redis_client: aioredis.Redis) -> None:
+async def snapshot_to_redis(redis_binary: aioredis.Redis, state: InferenceState) -> None:
+    """Serializes everything try_restore_snapshot() needs to reconstruct an identical InferenceState.
+    Runs on the main loop - same reasoning as handle_score: a local Redis write is fast enough that
+    the simplicity/correctness of awaiting it beats shaving a few hundred ms off one event every
+    SNAPSHOT_EVERY_N_EVENTS events."""
+    edge_t, edge_msg = state.edge_store.snapshot()
+    buffer = io.BytesIO()
+    torch.save(
+        {
+            "memory": state.memory.memory.cpu(),
+            "last_update": state.memory.last_update.cpu(),
+            "node_index": state.node_index,
+            "next_cold_start_id": state.next_cold_start_id,
+            "neighbors": state.neighbor_loader.neighbors.cpu(),
+            "e_id": state.neighbor_loader.e_id.cpu(),
+            "cur_e_id": state.neighbor_loader.cur_e_id,
+            "edge_t": edge_t.cpu(),
+            "edge_msg": edge_msg.cpu(),
+        },
+        buffer,
+    )
+    await redis_binary.set(REDIS_SNAPSHOT_KEY, buffer.getvalue())
+    logger.info("snapshotted runtime state to Redis (%d bytes)", buffer.tell())
+
+
+async def try_restore_snapshot(redis_binary: aioredis.Redis) -> dict | None:
+    blob = await redis_binary.get(REDIS_SNAPSHOT_KEY)
+    if blob is None:
+        return None
+    return torch.load(io.BytesIO(blob), weights_only=False)
+
+
+async def consume_loop(state: InferenceState, redis_client: aioredis.Redis, redis_binary: aioredis.Redis) -> None:
     consumer = AIOKafkaConsumer(
         TOPIC_TRANSFERS, bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS, group_id="inference-consumer"
     )
     await consumer.start()
     logger.info("consuming from topic %r...", TOPIC_TRANSFERS)
+    events_processed = 0
     try:
         async for msg in consumer:
             row = json.loads(msg.value.decode())
@@ -283,20 +361,31 @@ async def consume_loop(state: InferenceState, redis_client: aioredis.Redis) -> N
             if result is not None:
                 address, new_score = result
                 await handle_score(redis_client, address, new_score)
+            events_processed += 1
+            if events_processed % SNAPSHOT_EVERY_N_EVENTS == 0:
+                await snapshot_to_redis(redis_binary, state)
     finally:
         await consumer.stop()
+        if events_processed > 0:
+            # Covers a deliberate stop: a restart right after should always
+            # resume from the freshest possible state.
+            await snapshot_to_redis(redis_binary, state)
+            logger.info("final snapshot saved on shutdown")
 
 
 async def run() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("device: %s", device)
-    state = load_inference_state(device)
 
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    redis_binary = aioredis.from_url(REDIS_URL, decode_responses=False)
     try:
-        await consume_loop(state, redis_client)
+        snapshot = await try_restore_snapshot(redis_binary)
+        state = load_inference_state(device, snapshot)
+        await consume_loop(state, redis_client, redis_binary)
     finally:
         await redis_client.aclose()
+        await redis_binary.aclose()
 
 
 if __name__ == "__main__":
