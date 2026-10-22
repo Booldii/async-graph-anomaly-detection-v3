@@ -213,6 +213,7 @@ dependencies = [
     { name = "dotenv" },
     { name = "duckdb" },
     { name = "eth-typing" },
+    { name = "fastapi" },
     { name = "google-cloud" },
     { name = "google-cloud-bigquery" },
     { name = "google-cloud-bigquery-storage" },
@@ -227,6 +228,7 @@ dependencies = [
     { name = "seaborn" },
     { name = "torch" },
     { name = "torch-geometric" },
+    { name = "uvicorn" },
     { name = "web3" },
     { name = "xgboost" },
 ]
@@ -238,6 +240,7 @@ requires-dist = [
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "duckdb", specifier = ">=1.5.6" },
     { name = "eth-typing", specifier = ">=6.0.0" },
+    { name = "fastapi", specifier = ">=0.141.1" },
     { name = "google-cloud", specifier = ">=0.34.0" },
     { name = "google-cloud-bigquery", specifier = ">=3.45.1" },
     { name = "google-cloud-bigquery-storage", specifier = ">=2.41.0" },
@@ -252,6 +255,7 @@ requires-dist = [
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "torch", specifier = ">=2.14.1" },
     { name = "torch-geometric", specifier = ">=2.8.0.post1" },
+    { name = "uvicorn", specifier = ">=0.54.0" },
     { name = "web3", specifier = ">=8.0.0" },
     { name = "xgboost", specifier = ">=3.4.1" },
 ]

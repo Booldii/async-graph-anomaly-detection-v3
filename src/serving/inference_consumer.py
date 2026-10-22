@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -61,6 +62,9 @@ ALERT_THRESHOLD = 0.25
 
 REDIS_SCORE_KEY_PREFIX = "tgn:score:"
 REDIS_SNAPSHOT_KEY = "tgn:snapshot"
+REDIS_ALERTS_KEY = "tgn:alerts"
+# Bounds the list - without a cap it would grow for as long as the process runs
+ALERTS_LIST_MAX_LEN = 1000
 # every 2000 events: frequent enough that a crash loses little ground
 SNAPSHOT_EVERY_N_EVENTS = 2000
 
@@ -302,7 +306,8 @@ def process_event(state: InferenceState, row: dict) -> tuple[str, float] | None:
 
 
 async def handle_score(redis_client: aioredis.Redis, address: str, new_score: float) -> None:
-    """Delta/alert against Redis's last-known score, then persists the new one"""
+    """Delta/alert against Redis's last-known score, then persists the new one. An alert both
+    logs and pushes a record to the tgn:alerts list - the backend half of the alert panel"""
     key = REDIS_SCORE_KEY_PREFIX + address
     prev_raw = await redis_client.get(key)
     if prev_raw is not None:
@@ -312,6 +317,19 @@ async def handle_score(redis_client: aioredis.Redis, address: str, new_score: fl
             logger.warning(
                 "ALERT address=%s score=%.4f prev=%.4f delta=%+.4f", address, new_score, prev_score, delta
             )
+            record = json.dumps(
+                {
+                    "address": address,
+                    "score": new_score,
+                    "prev_score": prev_score,
+                    "delta": delta,
+                    "timestamp": time.time(),
+                }
+            )
+            # LPUSH (newest first) + LTRIM to cap the list - one round trip each, both cheap locally.
+            # Not pipelined together since this already only runs on the rare alert-firing path
+            await redis_client.lpush(REDIS_ALERTS_KEY, record)
+            await redis_client.ltrim(REDIS_ALERTS_KEY, 0, ALERTS_LIST_MAX_LEN - 1)
     await redis_client.set(key, str(new_score))
 
 

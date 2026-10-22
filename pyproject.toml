@@ -10,6 +10,7 @@ dependencies = [
     "dotenv>=0.9.9",
     "duckdb>=1.5.6",
     "eth-typing>=6.0.0",
+    "fastapi>=0.141.1",
     "google-cloud>=0.34.0",
     "google-cloud-bigquery>=3.45.1",
     "google-cloud-bigquery-storage>=2.41.0",
@@ -24,6 +25,7 @@ dependencies = [
     "seaborn>=0.13.2",
     "torch>=2.14.1",
     "torch-geometric>=2.8.0.post1",
+    "uvicorn>=0.54.0",
     "web3>=8.0.0",
     "xgboost>=3.4.1",
 ]
