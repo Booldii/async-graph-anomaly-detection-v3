@@ -386,7 +386,12 @@ async def try_restore_snapshot(redis_binary: aioredis.Redis) -> dict | None:
 
 async def consume_loop(state: InferenceState, redis_client: aioredis.Redis, redis_binary: aioredis.Redis) -> None:
     consumer = AIOKafkaConsumer(
-        TOPIC_TRANSFERS, bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS, group_id="inference-consumer"
+        TOPIC_TRANSFERS, bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS, group_id="inference-consumer",
+        # Only matters the very first time this consumer group ever starts - "earliest" means it
+        # reads everything already in the topic rather than only what arrives after it subscribes.
+        # Removes the startup-order race against the producer entirely, instead of trying to
+        # synchronize container start timing in docker-compose.
+        auto_offset_reset="earliest",
     )
     await consumer.start()
     logger.info("consuming from topic %r...", TOPIC_TRANSFERS)
