@@ -58,7 +58,13 @@ NULL_ADDRESSES = {
 }
 
 # Provisional - next step is to tune this empirically against the actual delta distribution from a replay run.
-ALERT_THRESHOLD = 0.25
+ALERT_THRESHOLD = 0.3
+
+# An address needs this many recorded transfers since this process started before it's
+# allowed to trigger an alert - below that, its score reflects a mostly cold/under-warmed memory,
+# so deltas are dominated by cold-start noise rather than real risk signal. Provisional, same as
+# ALERT_THRESHOLD above.
+MIN_TRANSFERS_FOR_ALERT = 5
 
 REDIS_SCORE_KEY_PREFIX = "tgn:score:"
 REDIS_SNAPSHOT_KEY = "tgn:snapshot"
@@ -137,6 +143,7 @@ class InferenceState:
         next_cold_start_id: int,
         total_capacity: int,
         device: torch.device,
+        transfer_count: dict[str, int] | None = None,
     ) -> None:
         self.memory = memory
         self.gnn = gnn
@@ -148,6 +155,9 @@ class InferenceState:
         self.total_capacity = total_capacity
         self.device = device
         self.assoc = torch.empty(total_capacity, dtype=torch.long, device=device)
+        # address (lowercase) -> number of events seen as sender or receiver since this process
+        # started. Persisted across restarts via the Redis snapshot.
+        self.transfer_count: dict[str, int] = transfer_count if transfer_count is not None else {}
 
 
 def load_inference_state(device: torch.device, snapshot: dict | None) -> InferenceState:
@@ -244,16 +254,20 @@ def load_inference_state(device: torch.device, snapshot: dict | None) -> Inferen
             original_num_nodes, COLD_START_RESERVED_SLOTS, historical_data.t.size(0),
         )
 
+    transfer_count = dict(snapshot.get("transfer_count", {})) if snapshot is not None else {}
+
     return InferenceState(
         memory, gnn, risk_head, neighbor_loader, edge_store, node_index,
         next_cold_start_id=next_cold_start_id, total_capacity=total_capacity, device=device,
+        transfer_count=transfer_count,
     )
 
 
-def process_event(state: InferenceState, row: dict) -> tuple[str, float] | None:
+def process_event(state: InferenceState, row: dict) -> tuple[str, float, bool] | None:
     """Pure tensor computation - mutates state in place (memory, neighbor_loader,
-    edge_store, node_index, next_cold_start_id). Returns (sender_address, new_risk_score), or
-    None if the event was skipped (mint/burn, or the cold-start buffer is exhausted)."""
+    edge_store, node_index, next_cold_start_id, transfer_count). Returns (sender_address,
+    new_risk_score, alert_eligible), or None if the event was skipped (mint/burn, or the
+    cold-start buffer is exhausted)."""
     # chain_listener.py emits EIP-55 checksummed addresses. On the other hand: node_index was
     # built from BigQuery's lowercase-hex convention. Normalize both to lowercase so a live
     # address that is already known doesn't get spuriously cold-started on a case mismatch.
@@ -276,6 +290,10 @@ def process_event(state: InferenceState, row: dict) -> tuple[str, float] | None:
 
     if from_addr not in state.node_index or to_addr not in state.node_index:
         return None  # buffer was exhausted above for one of the two addresses
+
+    for addr in (from_addr, to_addr):
+        state.transfer_count[addr] = state.transfer_count.get(addr, 0) + 1
+    eligible = state.transfer_count[from_addr] >= MIN_TRANSFERS_FOR_ALERT
 
     device = state.device
     src = torch.tensor([state.node_index[from_addr]], dtype=torch.long, device=device)
@@ -302,10 +320,10 @@ def process_event(state: InferenceState, row: dict) -> tuple[str, float] | None:
         state.neighbor_loader.insert(src, dst)
     state.edge_store.append(t, msg)
 
-    return from_addr, new_score
+    return from_addr, new_score, eligible
 
 
-async def handle_score(redis_client: aioredis.Redis, address: str, new_score: float) -> None:
+async def handle_score(redis_client: aioredis.Redis, address: str, new_score: float, eligible: bool) -> None:
     """Delta/alert against Redis's last-known score, then persists the new one. An alert both
     logs and pushes a record to the tgn:alerts list - the backend half of the alert panel"""
     key = REDIS_SCORE_KEY_PREFIX + address
@@ -313,7 +331,7 @@ async def handle_score(redis_client: aioredis.Redis, address: str, new_score: fl
     if prev_raw is not None:
         prev_score = float(prev_raw)
         delta = new_score - prev_score
-        if abs(delta) > ALERT_THRESHOLD:
+        if eligible and abs(delta) > ALERT_THRESHOLD:
             logger.warning(
                 "ALERT address=%s score=%.4f prev=%.4f delta=%+.4f", address, new_score, prev_score, delta
             )
@@ -346,6 +364,7 @@ async def snapshot_to_redis(redis_binary: aioredis.Redis, state: InferenceState)
             "last_update": state.memory.last_update.cpu(),
             "node_index": state.node_index,
             "next_cold_start_id": state.next_cold_start_id,
+            "transfer_count": state.transfer_count,
             "neighbors": state.neighbor_loader.neighbors.cpu(),
             "e_id": state.neighbor_loader.e_id.cpu(),
             "cur_e_id": state.neighbor_loader.cur_e_id,
@@ -377,8 +396,8 @@ async def consume_loop(state: InferenceState, redis_client: aioredis.Redis, redi
             row = json.loads(msg.value.decode())
             result = process_event(state, row)
             if result is not None:
-                address, new_score = result
-                await handle_score(redis_client, address, new_score)
+                address, new_score, eligible = result
+                await handle_score(redis_client, address, new_score, eligible)
             events_processed += 1
             if events_processed % SNAPSHOT_EVERY_N_EVENTS == 0:
                 await snapshot_to_redis(redis_binary, state)
