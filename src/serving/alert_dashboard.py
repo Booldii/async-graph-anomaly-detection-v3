@@ -10,7 +10,8 @@ import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-ALERT_PANEL_URL = "http://localhost:8000"
+from common import ALERT_PANEL_URL
+
 REFRESH_INTERVAL_MS = 5000
 ALERTS_LIMIT = 200
 

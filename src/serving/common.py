@@ -20,3 +20,4 @@ TOPIC_TRANSFERS = "eth-transfers"
 # Redis' default port) - overridable via env for anything other than this local demo stack.
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:19092")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+ALERT_PANEL_URL = os.environ.get("ALERT_PANEL_URL", "http://localhost:8000")
