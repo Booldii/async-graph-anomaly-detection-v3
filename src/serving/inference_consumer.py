@@ -167,6 +167,18 @@ def load_inference_state(device: torch.device, snapshot: dict | None) -> Inferen
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
 
     if snapshot is not None:
+        expected_total_capacity = len(checkpoint["node_index"]) + COLD_START_RESERVED_SLOTS
+        if snapshot["memory"].size(0) != expected_total_capacity:
+            logger.warning(
+                "Redis snapshot is incompatible with the current checkpoint (snapshot sized "
+                "for %d slots, current checkpoint needs %d) - checkpoint was likely "
+                "retrained/replaced since this snapshot was taken. Discarding snapshot, "
+                "cold-booting from checkpoint instead.",
+                snapshot["memory"].size(0), expected_total_capacity,
+            )
+            snapshot = None
+
+    if snapshot is not None:
         node_index: dict[str, int] = dict(snapshot["node_index"])
         next_cold_start_id = snapshot["next_cold_start_id"]
         # Always derived from the original Stage 2 checkpoint's node count - the reserved-slots
