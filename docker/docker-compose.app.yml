@@ -1,0 +1,56 @@
+# Stage 3 app stack - demo path only (replay_producer, inference_consumer, alert_panel,
+# alert_dashboard). chain_listener.py (live feed) is deferred
+#
+# Prerequisites before 'docker compose -f docker/docker-compose.app.yml --profile demo up --build':
+# 1. 'docker compose -f docker/docker-compose.infra.yml up -d' (Redpanda + Redis, separate
+#    compose project - this file does not declare depends_on them since they're not defined
+#    in this same file; Compose's depends_on only works within one file/project).
+# 2. 'uv run python scripts/fetch_artifacts.py' (downloads the large, gitignored data/
+#    files these services bind-mount below - they must exist on disk before 'up', otherwise
+#    Docker silently mounts an empty directory instead of failing loudly).
+
+networks:
+  default:
+    name: onchain-net
+    external: true
+
+services:
+  replay_producer:
+    build:
+      context: ..
+      dockerfile: docker/producer.Dockerfile
+    profiles: ["demo"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+    volumes:
+      - ../data/interim:/app/data/interim:ro
+
+  inference_consumer:
+    build:
+      context: ..
+      dockerfile: docker/inference_consumer.Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - ../data/processed:/app/data/processed:ro
+
+  alert_panel:
+    build:
+      context: ..
+      dockerfile: docker/alert_panel.Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "8000:8000"
+
+  alert_dashboard:
+    build:
+      context: ..
+      dockerfile: docker/alert_dashboard.Dockerfile
+    environment:
+      ALERT_PANEL_URL: http://alert_panel:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - alert_panel
