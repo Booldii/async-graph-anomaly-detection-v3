@@ -343,7 +343,7 @@ async def handle_score(redis_client: aioredis.Redis, address: str, new_score: fl
     if prev_raw is not None:
         prev_score = float(prev_raw)
         delta = new_score - prev_score
-        if eligible and abs(delta) > ALERT_THRESHOLD:
+        if eligible and delta > ALERT_THRESHOLD:
             logger.warning(
                 "ALERT address=%s score=%.4f prev=%.4f delta=%+.4f", address, new_score, prev_score, delta
             )

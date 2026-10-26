@@ -13,7 +13,7 @@ from streamlit_autorefresh import st_autorefresh
 from common import ALERT_PANEL_URL
 
 REFRESH_INTERVAL_MS = 5000
-ALERTS_LIMIT = 200
+ALERTS_LIMIT = 1000
 
 # Thresholds only for the severity label column below - independent of inference_consumer.py's
 # own alert threshold. These just flag among alerts already shown, which ones look most notable
@@ -21,10 +21,14 @@ ALERTS_LIMIT = 200
 HIGH_ABSOLUTE_SCORE = 0.8
 HIGH_SWING_DELTA = 0.4
 
+# Spike chart window/bucket size - provisional
+SPIKE_WINDOW_SECONDS = 600
+SPIKE_BUCKET_SECONDS = 30
+
 st.set_page_config(page_title="TGN Risk Alerts", layout="wide")
 st_autorefresh(interval=REFRESH_INTERVAL_MS, key="alerts_refresh")
 
-st.title("Stage 3 - Live Risk Alerts")
+st.title("Live Risk Alert Panel")
 
 try:
     response = requests.get(f"{ALERT_PANEL_URL}/alerts", params={"n": ALERTS_LIMIT}, timeout=3)
@@ -56,6 +60,15 @@ else:
 
     alerts_last_hour = int((df["timestamp"] > time.time() - 3600).sum())
     st.metric("Alerts in the last hour", alerts_last_hour)
+
+    now = time.time()
+    recent = df[df["timestamp"] > now - SPIKE_WINDOW_SECONDS]
+    num_buckets = SPIKE_WINDOW_SECONDS // SPIKE_BUCKET_SECONDS
+    bucket_index = ((now - recent["timestamp"]) // SPIKE_BUCKET_SECONDS).astype(int)
+    counts = bucket_index.value_counts().reindex(range(num_buckets), fill_value=0).sort_index(ascending=False)
+    counts.index = pd.to_datetime(now - counts.index * SPIKE_BUCKET_SECONDS, unit="s")
+    st.bar_chart(counts, x_label="Time", y_label="Alerts")
+    st.caption(f"Alerts in the last {SPIKE_WINDOW_SECONDS // 60} min, {SPIKE_BUCKET_SECONDS}s buckets")
 
     def severity_label(row: pd.Series) -> str:
         # Independent, non-exclusive checks - an address can be both, shown as high + swing.
