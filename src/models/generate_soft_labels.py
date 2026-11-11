@@ -1,6 +1,11 @@
 """
 Applies the final production ensemble (trained on the full labeled dataset) to the point-in-time
-feature snapshots, producing soft risk labels.
+feature snapshots, producing soft risk labels. No change to the scoring logic itself for either mode -
+only the join key differs:
+
+- --mode stream (default): incremental_feature_engine.py's output, one row per (address, event_row_id)
+- --mode daily: build_time_snapshots.py's output, one row per (address, snapshot_day) - the original,
+   untouched pipeline, kept runnable for side-by-side comparison.
 
 Consensus = unweighted mean of the 4 family models' predicted probabilities. Divergence = standard
 deviation across families - the same disagreement-as-uncertainty signal established during
@@ -11,6 +16,7 @@ These are an ordinal risk ranking, rather than a calibrated probability: the his
 real-world meaning here - only relative ordering between addresses/snapshots is meaningful.
 """
 
+import argparse
 from pathlib import Path
 
 import mlflow
@@ -19,9 +25,19 @@ import pandas as pd
 from train_xgboost_ensemble import FEATURE_FAMILIES, MLFLOW_EXPERIMENT_NAME, MLFLOW_TRACKING_DIR
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SNAPSHOTS_PATH = PROJECT_ROOT / "data" / "processed" / "eth_fresh_sample_features_snapshots.parquet"
-OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "eth_fresh_soft_labels.parquet"
 
+MODE_PATHS = {
+    "daily": {
+        "snapshots": PROJECT_ROOT / "data" / "processed" / "eth_fresh_sample_features_snapshots.parquet",
+        "output": PROJECT_ROOT / "data" / "processed" / "eth_fresh_soft_labels.parquet",
+        "key_col": "snapshot_day",
+    },
+    "stream": {
+        "snapshots": PROJECT_ROOT / "data" / "processed" / "eth_fresh_sample_features_stream.parquet",
+        "output": PROJECT_ROOT / "data" / "processed" / "eth_fresh_soft_labels_stream.parquet",
+        "key_col": "event_row_id",
+    },
+}
 
 def find_final_model_run() -> str:
     runs = mlflow.search_runs(
@@ -53,7 +69,7 @@ def load_family_models(run_id: str) -> dict:
     return models
 
 
-def score(df: pd.DataFrame, models: dict) -> pd.DataFrame:
+def score(df: pd.DataFrame, models: dict, key_col: str) -> pd.DataFrame:
     probs = pd.DataFrame(index=df.index)
     for family, feats in FEATURE_FAMILIES.items():
         probs[family] = models[family].predict_proba(df[feats])[:, 1]
@@ -61,26 +77,31 @@ def score(df: pd.DataFrame, models: dict) -> pd.DataFrame:
     result = probs.copy()
     result["consensus_score"] = probs.mean(axis=1)
     result["divergence"] = probs.std(axis=1)
-    result["snapshot_day"] = df["snapshot_day"]
+    result[key_col] = df[key_col]
     return result
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=["daily", "stream"], default="stream")
+    args = parser.parse_args()
+    paths = MODE_PATHS[args.mode]
+
     mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_TRACKING_DIR / 'mlflow.db'}")
 
     run_id = find_final_model_run()
     print(f"using final_model run: {run_id}")
     models = load_family_models(run_id)
 
-    df = pd.read_parquet(SNAPSHOTS_PATH)
-    result = score(df, models)
+    df = pd.read_parquet(paths["snapshots"])
+    result = score(df, models, paths["key_col"])
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    result.to_parquet(OUTPUT_PATH)
+    paths["output"].parent.mkdir(parents=True, exist_ok=True)
+    result.to_parquet(paths["output"])
 
-    print(f"\n{len(result):,} (address, day) soft labels")
+    print(f"\n{len(result):,} (address, {paths['key_col']}) soft labels")
     print(result["consensus_score"].describe())
-    print(f"\nsaved to: {OUTPUT_PATH}")
+    print(f"\nsaved to: {paths['output']}")
 
 
 if __name__ == "__main__":

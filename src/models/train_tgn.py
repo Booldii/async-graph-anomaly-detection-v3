@@ -18,6 +18,7 @@ Decisions made regarding architecture of training:
   validation is "the future" relative to training, not a separate population.
 """
 
+import argparse
 from pathlib import Path
 
 import mlflow
@@ -36,8 +37,17 @@ from torch_geometric.nn.models.tgn import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-GRAPH_PATH = PROJECT_ROOT / "data" / "processed" / "eth_fresh_temporal_graph.pt"
-CHECKPOINT_PATH = PROJECT_ROOT / "data" / "processed" / "tgn_checkpoint.pt"
+
+GRAPH_MODES = {
+    "daily": {
+        "graph": PROJECT_ROOT / "data" / "processed" / "eth_fresh_temporal_graph.pt",
+        "checkpoint": PROJECT_ROOT / "data" / "processed" / "tgn_checkpoint.pt",
+    },
+    "stream": {
+        "graph": PROJECT_ROOT / "data" / "processed" / "eth_fresh_temporal_graph_stream.pt",
+        "checkpoint": PROJECT_ROOT / "data" / "processed" / "tgn_checkpoint_stream.pt",
+    },
+}
 
 MLFLOW_TRACKING_DIR = PROJECT_ROOT / "mlruns"
 MLFLOW_EXPERIMENT_NAME = "tgn_risk_scoring"
@@ -48,7 +58,7 @@ EMBEDDING_DIM = 100
 NEIGHBOR_SIZE = 10
 BATCH_SIZE = 200
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 5
+NUM_EPOCHS = 10
 
 
 class GraphAttentionEmbedding(torch.nn.Module):
@@ -80,10 +90,15 @@ class RiskHead(torch.nn.Module):
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--graph", choices=["daily", "stream"], default="daily")
+    args = parser.parse_args()
+    paths = GRAPH_MODES[args.graph]
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
-    checkpoint = torch.load(GRAPH_PATH, weights_only=False)
+    checkpoint = torch.load(paths["graph"], weights_only=False)
     data = checkpoint["data"].to(device)
     num_nodes = len(checkpoint["node_index"])
     msg_dim = data.msg.size(-1)
@@ -185,6 +200,7 @@ def main() -> None:
     with mlflow.start_run():
         mlflow.log_params(
             {
+                "label_mode": args.graph,
                 "memory_dim": MEMORY_DIM,
                 "time_dim": TIME_DIM,
                 "embedding_dim": EMBEDDING_DIM,
@@ -226,10 +242,10 @@ def main() -> None:
                     "cur_e_id": neighbor_loader.cur_e_id,
                 },
             },
-            CHECKPOINT_PATH,
+            paths["checkpoint"],
         )
-        mlflow.log_artifact(str(CHECKPOINT_PATH))
-        print(f"\nsaved checkpoint to: {CHECKPOINT_PATH}")
+        mlflow.log_artifact(str(paths["checkpoint"]))
+        print(f"\nsaved checkpoint to: {paths['checkpoint']}")
 
 
 if __name__ == "__main__":

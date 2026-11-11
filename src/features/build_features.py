@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from common import NULL_ADDRESSES, entropy_normalized, is_round_value
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # training mode:
@@ -28,11 +30,6 @@ OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "bybit_address_features.parq
 FRESH_SAMPLE_PATH = PROJECT_ROOT / "data" / "interim" / "eth_fresh_sample.parquet"
 FRESH_CONTRACT_FLAGS_PATH = PROJECT_ROOT / "data" / "interim" / "eth_fresh_address_contract_flags.parquet"
 SCORING_OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "eth_fresh_sample_features.parquet"
-
-NULL_ADDRESSES = {
-    "0x0000000000000000000000000000000000000000",
-    "0x000000000000000000000000000000000000dead",
-}
 
 
 def load_raw_transfers(path: Path = RAW_DATA_PATH) -> pd.DataFrame:
@@ -111,26 +108,6 @@ def add_value_zscore(df_graph: pd.DataFrame, labeled_addresses: set[str]) -> pd.
 
 def _safe_set(x: object) -> set:
     return x if isinstance(x, set) else set()
-
-
-def _entropy_normalized(counts: pd.DataFrame, group_col: str, key_col: str) -> pd.Series:
-    """Normalized entropy of the count distribution within group_col"""
-    total = counts.groupby(group_col)["count"].transform("sum")
-    share = counts["count"] / total
-    entropy_term = -share * np.log(share.clip(lower=1e-12))
-    raw_entropy = counts.assign(entropy_term=entropy_term).groupby(group_col)["entropy_term"].sum()
-    n_keys = counts.groupby(group_col)[key_col].nunique()
-    return (raw_entropy / np.log(n_keys.clip(lower=2))).fillna(0)
-
-
-def _is_round_value(values: np.ndarray, sig: int = 2) -> np.ndarray:
-    """AML heuristic: does the amount have a suspiciously low number of significant digits"""
-    positive = values > 0
-    magnitude = np.zeros_like(values)
-    magnitude[positive] = 10 ** np.floor(np.log10(values[positive]))
-    scaled = np.divide(values, magnitude, out=np.zeros_like(values), where=positive)
-    reconstructed = np.round(scaled, sig - 1) * magnitude
-    return positive & (np.abs(values - reconstructed) < 1e-6)
 
 
 def build_base_features(sent: pd.DataFrame, received: pd.DataFrame) -> pd.DataFrame:
@@ -235,7 +212,7 @@ def build_relational_features(
     )
 
     cp_value = sent.groupby(["address", "to"])["value"].sum().rename("count").reset_index()
-    out_counterparty_entropy = _entropy_normalized(cp_value, "address", "to").rename(
+    out_counterparty_entropy = entropy_normalized(cp_value, "address", "to").rename(
         "out_counterparty_entropy"
     )
 
@@ -245,7 +222,7 @@ def build_relational_features(
 def build_shape_and_temporal_features(sent: pd.DataFrame, received: pd.DataFrame) -> pd.DataFrame:
     """Value roundness (AML heuristic), number of active days, activity hour entropy."""
     round_value_share = (
-        sent.assign(is_round=_is_round_value(sent["value"].to_numpy()))
+        sent.assign(is_round=is_round_value(sent["value"].to_numpy()))
         .groupby("address")["is_round"]
         .mean()
         .rename("round_value_share")
@@ -266,7 +243,7 @@ def build_shape_and_temporal_features(sent: pd.DataFrame, received: pd.DataFrame
          pd.DataFrame({"address": received["address"], "hour": received_hours})]
     )
     hour_counts = all_hours.groupby(["address", "hour"]).size().rename("count").reset_index()
-    hour_of_day_entropy = _entropy_normalized(hour_counts, "address", "hour").rename(
+    hour_of_day_entropy = entropy_normalized(hour_counts, "address", "hour").rename(
         "hour_of_day_entropy"
     )
 
