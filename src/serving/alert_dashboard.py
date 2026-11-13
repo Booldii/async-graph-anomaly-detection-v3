@@ -19,7 +19,7 @@ ALERTS_LIMIT = 1000
 # own alert threshold. These just flag among alerts already shown, which ones look most notable
 # at a glance.
 HIGH_ABSOLUTE_SCORE = 0.8
-HIGH_SWING_DELTA = 0.4
+HIGH_SWING_DELTA = 0.3
 
 # Spike chart window/bucket size - provisional
 SPIKE_WINDOW_SECONDS = 600

@@ -46,6 +46,7 @@ MEMORY_DIM = DEFAULT_HPARAMS["memory_dim"]
 EMBEDDING_DIM = DEFAULT_HPARAMS["embedding_dim"]
 NEIGHBOR_SIZE = DEFAULT_HPARAMS["neighbor_size"]
 TIME_DIM = DEFAULT_HPARAMS["time_dim"]
+DROPOUT = DEFAULT_HPARAMS["dropout"]
 
 GRAPH_PATH = GRAPH_MODES["stream"]["graph"]
 CHECKPOINT_PATH = GRAPH_MODES["stream"]["checkpoint"]
@@ -62,7 +63,7 @@ NULL_ADDRESSES = {
 }
 
 # Provisional - next step is to tune this empirically against the actual delta distribution from a replay run.
-ALERT_THRESHOLD = 0.3
+ALERT_THRESHOLD = 0.2
 
 # An address needs this many recorded transfers since this process started before it's
 # allowed to trigger an alert - below that, its score reflects a mostly cold/under-warmed memory,
@@ -234,7 +235,11 @@ def load_inference_state(device: torch.device, snapshot: dict | None) -> Inferen
             memory.last_update[:original_num_nodes] = saved_last_update.to(device)
 
     gnn = GraphAttentionEmbedding(
-        in_channels=MEMORY_DIM, out_channels=EMBEDDING_DIM, msg_dim=MSG_DIM, time_enc=memory.time_enc
+        in_channels=MEMORY_DIM,
+        out_channels=EMBEDDING_DIM,
+        msg_dim=MSG_DIM,
+        time_enc=memory.time_enc,
+        dropout=DROPOUT,
     ).to(device)
     gnn.load_state_dict(checkpoint["gnn"])
 

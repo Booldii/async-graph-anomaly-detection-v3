@@ -26,7 +26,6 @@ import argparse
 from pathlib import Path
 
 import mlflow
-import optuna
 import torch
 import torch.nn.functional as F
 from scipy.stats import spearmanr
@@ -277,6 +276,8 @@ def run_training(
                 print(f"  -> new best val_spearman={val_rho:.6f}, saved checkpoint to: {save_path}")
 
             if trial is not None:
+                import optuna
+
                 trial.report(val_rho, step=epoch)
                 if trial.should_prune():
                     raise optuna.TrialPruned()
