@@ -34,17 +34,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # `uv run python src/serving/inference_consumer.py` - added explicitly to reuse its model
 # classes/constants directly rather than duplicating them.
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "models"))
+
 from train_tgn import (  # noqa: E402
-    CHECKPOINT_PATH,
-    EMBEDDING_DIM,
-    MEMORY_DIM,
-    NEIGHBOR_SIZE,
-    TIME_DIM,
+    DEFAULT_HPARAMS,
+    GRAPH_MODES,
     GraphAttentionEmbedding,
     RiskHead,
 )
 
-GRAPH_PATH = PROJECT_ROOT / "data" / "processed" / "eth_fresh_temporal_graph.pt"
+MEMORY_DIM = DEFAULT_HPARAMS["memory_dim"]
+EMBEDDING_DIM = DEFAULT_HPARAMS["embedding_dim"]
+NEIGHBOR_SIZE = DEFAULT_HPARAMS["neighbor_size"]
+TIME_DIM = DEFAULT_HPARAMS["time_dim"]
+
+GRAPH_PATH = GRAPH_MODES["stream"]["graph"]
+CHECKPOINT_PATH = GRAPH_MODES["stream"]["checkpoint"]
 
 # log(value), log(gasUsed), log(gasPrice) - matches build_temporal_graph.py's msg vector
 MSG_DIM = 3

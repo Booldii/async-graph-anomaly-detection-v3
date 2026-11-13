@@ -19,8 +19,8 @@ HF_REPO_ID = os.environ.get("HF_REPO_ID", "booldii/onchain-risk-tgn")
 # (local destination, filename as stored in the HF repo) - same basename on both sides here,
 # kept separate in case the two ever need to diverge.
 ARTIFACTS = [
-    (PROJECT_ROOT / "data" / "processed" / "tgn_checkpoint.pt", "tgn_checkpoint.pt"),
-    (PROJECT_ROOT / "data" / "processed" / "eth_fresh_temporal_graph.pt", "eth_fresh_temporal_graph.pt"),
+    (PROJECT_ROOT / "data" / "processed" / "tgn_checkpoint_stream_final.pt", "tgn_checkpoint_stream_final.pt"),
+    (PROJECT_ROOT / "data" / "processed" / "eth_fresh_temporal_graph_stream.pt", "eth_fresh_temporal_graph_stream.pt"),
     (PROJECT_ROOT / "data" / "interim" / "eth_fresh_sample.parquet", "eth_fresh_sample.parquet"),
 ]
 
