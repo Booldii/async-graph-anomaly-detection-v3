@@ -19,5 +19,7 @@ mlruns/
 # .env keys
 .env
 
+## opt logs
+src/models/sweep.log
 
 

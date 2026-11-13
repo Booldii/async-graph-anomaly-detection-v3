@@ -36,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sortedcontainers import SortedList
 
 from common import NULL_ADDRESSES, entropy_normalized_from_counts, is_round_value_scalar
 
@@ -85,11 +86,53 @@ class TokenState:
 
 
 @dataclass(slots=True)
+class ZScoreAccumulator:
+    """Incremental mean/median/std/max of an address's own sent-or-received z-scores.
+
+    Found empirically necessary: recomputing mean/median/std/max from scratch on every
+    emission (the original approach, via plain Python lists + numpy) is O(k) per update for
+    an address with k events so far - fine for typical addresses, but catastrophic for the
+    handful of extreme hubs this data actually has. mean/std/maxdo have exact O(1) incremental
+    update rules - only median doesn't, hence SortedList, the same fundamental issue as TokenState's
+    reference median/MAD above, just scoped to one address's own history instead of one token's
+    background population.
+    """
+
+    sorted_values: SortedList = field(default_factory=SortedList)
+    count: int = 0
+    mean: float = 0.0
+    m2: float = 0.0
+    max_value: float = -math.inf
+
+    def add(self, value: float) -> None:
+        self.sorted_values.add(value)
+        self.count += 1
+        delta = value - self.mean
+        self.mean += delta / self.count
+        self.m2 += delta * (value - self.mean)
+        if value > self.max_value:
+            self.max_value = value
+
+    def stats(self) -> tuple[float, float, float, float]:
+        """mean/median/std/max - NaN for an empty accumulator, ddof=1 std"""
+        if self.count == 0:
+            return math.nan, math.nan, math.nan, math.nan
+        mid = self.count // 2
+        median = (
+            self.sorted_values[mid]
+            if self.count % 2
+            else (self.sorted_values[mid - 1] + self.sorted_values[mid]) / 2
+        )
+        std = math.sqrt(self.m2 / (self.count - 1)) if self.count > 1 else math.nan
+        return self.mean, median, std, self.max_value
+
+
+@dataclass(slots=True)
 class AddressState:
     out_degree: int = 0
     in_degree: int = 0
-    sent_zscores: list[float] = field(default_factory=list)
-    received_zscores: list[float] = field(default_factory=list)
+    sent_zscores: ZScoreAccumulator = field(default_factory=ZScoreAccumulator)
+    received_zscores: ZScoreAccumulator = field(default_factory=ZScoreAccumulator)
     seen_tx_hashes: set = field(default_factory=set)
     gas_price_sum: float = 0.0
     gas_used_sum: float = 0.0
@@ -99,7 +142,14 @@ class AddressState:
     tokens_received: set = field(default_factory=set)
     out_neighbors: set = field(default_factory=set)
     in_neighbors: set = field(default_factory=set)
+    reciprocal_count: int = 0
+    contract_neighbor_count: int = 0
     counterparty_value: dict = field(default_factory=dict)  # to_address -> cumulative value sent
+    # sum c*log(c) over counterparty_value's values, maintained incrementally) - lets out_counterparty_entropy
+    # be read in O(1) as log(total) - entropy_s/total, instead of rebuilding + summing over every distinct
+    # counterparty on every emission.
+    counterparty_total_value: float = 0.0
+    counterparty_entropy_s: float = 0.0
     hour_counts: dict = field(default_factory=dict)  # hour (0-23) -> touch count, sent + received
     days_active: set = field(default_factory=set)  # UTC calendar-day indices (timestamp // 86400)
     round_count: int = 0
@@ -111,25 +161,55 @@ class AddressState:
     self_loop_count: int = 0
 
 
-def _zscore_stats(values: list[float]) -> tuple[float, float, float, float]:
-    """mean/median/std/max of an address's own sent-or-received z-scores so far - NaN for an empty
-    list and ddof=1 (pandas std default, itself NaN for a single-element list)."""
-    if not values:
-        return math.nan, math.nan, math.nan, math.nan
-    arr = np.asarray(values, dtype=np.float64)
-    std = float(arr.std(ddof=1)) if arr.size > 1 else math.nan
-    return float(arr.mean()), float(np.median(arr)), std, float(arr.max())
+def _add_out_neighbor(s: AddressState, addr: str, contract_set: set) -> None:
+    if addr in s.out_neighbors:
+        return
+    new_to_union = addr not in s.in_neighbors
+    if not new_to_union:
+        s.reciprocal_count += 1
+    s.out_neighbors.add(addr)
+    if new_to_union and addr in contract_set:
+        s.contract_neighbor_count += 1
+
+
+def _add_in_neighbor(s: AddressState, addr: str, contract_set: set) -> None:
+    if addr in s.in_neighbors:
+        return
+    new_to_union = addr not in s.out_neighbors
+    if not new_to_union:
+        s.reciprocal_count += 1
+    s.in_neighbors.add(addr)
+    if new_to_union and addr in contract_set:
+        s.contract_neighbor_count += 1
+
+
+def _update_counterparty_value(s: AddressState, to_addr: str, value: float) -> None:
+    old_c = s.counterparty_value.get(to_addr, 0.0)
+    new_c = old_c + value
+    if old_c > 0:
+        s.counterparty_entropy_s -= old_c * math.log(old_c)
+    if new_c > 0:
+        s.counterparty_entropy_s += new_c * math.log(new_c)
+    s.counterparty_value[to_addr] = new_c
+    s.counterparty_total_value += value
+
+
+def _counterparty_entropy(s: AddressState) -> float:
+    """out_counterparty_entropy, O(1): H = log(T) - S/T for the share distribution p_i = c_i/T"""
+    n_keys = len(s.counterparty_value)
+    if n_keys == 0 or s.counterparty_total_value <= 0:
+        return 0.0
+    raw_entropy = math.log(s.counterparty_total_value) - s.counterparty_entropy_s / s.counterparty_total_value
+    return raw_entropy / math.log(max(n_keys, 2))
 
 
 def _emit_row(address: str, s: AddressState, contract_set: set, event_row_id: int) -> dict:
-    sent_mean, sent_median, sent_std, sent_max = _zscore_stats(s.sent_zscores)
-    recv_mean, recv_median, recv_std, recv_max = _zscore_stats(s.received_zscores)
+    sent_mean, sent_median, sent_std, sent_max = s.sent_zscores.stats()
+    recv_mean, recv_median, recv_std, recv_max = s.received_zscores.stats()
 
-    all_neighbors = s.out_neighbors | s.in_neighbors
-    reciprocal = s.out_neighbors & s.in_neighbors
-    reciprocity_rate = len(reciprocal) / len(all_neighbors) if all_neighbors else 0.0
-    contract_neighbors = sum(1 for n in all_neighbors if n in contract_set)
-    neighbor_contract_share = contract_neighbors / len(all_neighbors) if all_neighbors else 0.0
+    n_union = len(s.out_neighbors) + len(s.in_neighbors) - s.reciprocal_count
+    reciprocity_rate = s.reciprocal_count / n_union if n_union else 0.0
+    neighbor_contract_share = s.contract_neighbor_count / n_union if n_union else 0.0
 
     total_degree = s.out_degree + s.in_degree
     return {
@@ -161,7 +241,7 @@ def _emit_row(address: str, s: AddressState, contract_set: set, event_row_id: in
         "tokens_received": float(len(s.tokens_received)),
         "unique_tokens": float(len(s.tokens_sent) + len(s.tokens_received)),
         "reciprocity_rate": reciprocity_rate,
-        "out_counterparty_entropy": entropy_normalized_from_counts(s.counterparty_value),
+        "out_counterparty_entropy": _counterparty_entropy(s),
         "self_loop_count": float(s.self_loop_count),
         "neighbor_contract_share": neighbor_contract_share,
     }
@@ -224,7 +304,7 @@ def process_sample(df: pd.DataFrame, contract_set: set) -> pd.DataFrame:
         if not from_is_contract:
             s = addr_states.setdefault(from_addr, AddressState())
             s.out_degree += 1
-            s.sent_zscores.append(zscore)
+            s.sent_zscores.add(zscore)
             if tx_hash not in s.seen_tx_hashes:
                 s.seen_tx_hashes.add(tx_hash)
                 s.gas_price_sum += gas_price
@@ -232,8 +312,8 @@ def process_sample(df: pd.DataFrame, contract_set: set) -> pd.DataFrame:
                 s.gas_fee_sum += gas_fee
                 s.gas_tx_count += 1
             s.tokens_sent.add(token)
-            s.out_neighbors.add(to_addr)
-            s.counterparty_value[to_addr] = s.counterparty_value.get(to_addr, 0.0) + value
+            _add_out_neighbor(s, to_addr, contract_set)
+            _update_counterparty_value(s, to_addr, value)
             s.hour_counts[hour] = s.hour_counts.get(hour, 0) + 1
             s.days_active.add(day)
             if is_round_value_scalar(value):
@@ -245,9 +325,9 @@ def process_sample(df: pd.DataFrame, contract_set: set) -> pd.DataFrame:
         if not to_is_contract:
             r = addr_states.setdefault(to_addr, AddressState())
             r.in_degree += 1
-            r.received_zscores.append(zscore)
+            r.received_zscores.add(zscore)
             r.tokens_received.add(token)
-            r.in_neighbors.add(from_addr)
+            _add_in_neighbor(r, from_addr, contract_set)
             r.hour_counts[hour] = r.hour_counts.get(hour, 0) + 1
             r.days_active.add(day)
 

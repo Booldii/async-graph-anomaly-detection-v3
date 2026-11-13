@@ -26,13 +26,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
 FRESH_CONTRACT_FLAGS_PATH = PROJECT_ROOT / "data" / "interim" / "eth_fresh_address_contract_flags.parquet"
 OUTPUT_PATH = PROJECT_ROOT / "data" / "interim" / "eth_fresh_sample.parquet"
+DUCKDB_TEMP_DIR = PROJECT_ROOT / ".duckdb_tmp"
+DUCKDB_MEMORY_LIMIT = "20GB"
 
 NULL_ADDRESSES = {
     "0x0000000000000000000000000000000000000000",
     "0x000000000000000000000000000000000000dead",
 }
 
-DEFAULT_FRACTION = 0.01
+DEFAULT_FRACTION = 0.02
 DEFAULT_STRATA = 4
 DEFAULT_SEED = 42
 
@@ -106,7 +108,10 @@ def main() -> None:
     fresh_path = find_latest_fresh_path(RAW_DATA_DIR)
     print(f"using latest fresh pull: {fresh_path.name}")
 
+    DUCKDB_TEMP_DIR.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect()
+    con.execute(f"SET temp_directory='{DUCKDB_TEMP_DIR}'")
+    con.execute(f"SET memory_limit='{DUCKDB_MEMORY_LIMIT}'")
     load_and_dedup(con, fresh_path)
 
     activity = compute_eoa_activity(con)

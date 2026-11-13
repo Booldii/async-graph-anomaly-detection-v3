@@ -1,6 +1,6 @@
 """
 Trains a Temporal Graph Network (TGN) on the sampled fresh transfer graph
-(build_temporal_graph.py's output) using the per-event soft labels as the regression target.
+(build_temporal_graph.py's output), using the per-event soft labels as the regression target.
 
 Architecture: PyTorch Geometric's reference TGN (memory module with a GRU-based updater + a
 graph-attention embedding module over a bounded recent-neighbor window), adapted for node-level
@@ -16,12 +16,17 @@ Decisions made regarding architecture of training:
 - Train = days 1-11, validation = days 12-14, continuing the same memory/neighbor state from train
   into validation within one epoch - mirrors how this would actually run in production:
   validation is "the future" relative to training, not a separate population.
+
+run_training() is the single training/eval routine, shared by this script's own CLI and by
+tune_tgn.py's Optuna sweep. Keeping this one function shared means the final, promoted retrain
+after a sweep goes through the exact same code path as the existing reference runs.
 """
 
 import argparse
 from pathlib import Path
 
 import mlflow
+import optuna
 import torch
 import torch.nn.functional as F
 from scipy.stats import spearmanr
@@ -38,6 +43,8 @@ from torch_geometric.nn.models.tgn import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+# --graph stream trains on incremental_feature_engine.py's per-transfer soft labels
+# actually serves from - the two are kept side by side for the val_spearman comparison
 GRAPH_MODES = {
     "daily": {
         "graph": PROJECT_ROOT / "data" / "processed" / "eth_fresh_temporal_graph.pt",
@@ -45,28 +52,37 @@ GRAPH_MODES = {
     },
     "stream": {
         "graph": PROJECT_ROOT / "data" / "processed" / "eth_fresh_temporal_graph_stream.pt",
-        "checkpoint": PROJECT_ROOT / "data" / "processed" / "tgn_checkpoint_stream.pt",
+        "checkpoint": PROJECT_ROOT / "data" / "processed" / "tgn_checkpoint_stream_final.pt",
     },
 }
 
 MLFLOW_TRACKING_DIR = PROJECT_ROOT / "mlruns"
 MLFLOW_EXPERIMENT_NAME = "tgn_risk_scoring"
 
-MEMORY_DIM = 100
-TIME_DIM = 100
-EMBEDDING_DIM = 100
-NEIGHBOR_SIZE = 10
-BATCH_SIZE = 200
-LEARNING_RATE = 1e-4
+# Defaults for the manual CLI path (python train_tgn.py --graph ...) - a sweep (tune_tgn.py)
+# overrides any subset of these via run_training's hparams dict. memory_dim/neighbor_size are
+# also the two levers with by far the biggest VRAM impact.
+# Hardcoded hparams that gave best val results in Optuna's sweep:
+DEFAULT_HPARAMS = {
+    "memory_dim": 64,
+    "time_dim": 100,
+    "embedding_dim": 64,
+    "neighbor_size": 11,
+    "batch_size": 100,
+    "learning_rate": 7.7e-4,
+    "dropout": 0.13,
+}
 NUM_EPOCHS = 10
 
 
 class GraphAttentionEmbedding(torch.nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, msg_dim: int, time_enc: TimeEncoder):
+    def __init__(
+        self, in_channels: int, out_channels: int, msg_dim: int, time_enc: TimeEncoder, dropout: float
+    ):
         super().__init__()
         self.time_enc = time_enc
         edge_dim = msg_dim + time_enc.out_channels
-        self.conv = TransformerConv(in_channels, out_channels // 2, heads=2, dropout=0.1, edge_dim=edge_dim)
+        self.conv = TransformerConv(in_channels, out_channels // 2, heads=2, dropout=dropout, edge_dim=edge_dim)
 
     def forward(self, x, last_update, edge_index, t, msg):
         rel_t = last_update[edge_index[0]] - t
@@ -89,14 +105,24 @@ class RiskHead(torch.nn.Module):
         return torch.sigmoid(self.lin2(h)).squeeze(-1)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--graph", choices=["daily", "stream"], default="daily")
-    args = parser.parse_args()
-    paths = GRAPH_MODES[args.graph]
+def run_training(
+    graph_mode: str,
+    epochs: int,
+    hparams: dict | None = None,
+    trial: "optuna.Trial | None" = None,
+    mlflow_experiment: str = MLFLOW_EXPERIMENT_NAME,
+    checkpoint_path: Path | None = None,
+) -> dict:
+    """Builds the model, trains for `epochs`, saves the checkpoint, and returns
+    {"val_spearman", "val_mse", "checkpoint_path"}"""
+    hp = {**DEFAULT_HPARAMS, **(hparams or {})}
+    paths = GRAPH_MODES[graph_mode]
+    save_path = checkpoint_path or paths["checkpoint"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
 
     checkpoint = torch.load(paths["graph"], weights_only=False)
     data = checkpoint["data"].to(device)
@@ -105,29 +131,33 @@ def main() -> None:
 
     train_data = data[data.train_mask]
     val_data = data[data.val_mask]
-    train_loader = TemporalDataLoader(train_data, batch_size=BATCH_SIZE)
-    val_loader = TemporalDataLoader(val_data, batch_size=BATCH_SIZE)
+    train_loader = TemporalDataLoader(train_data, batch_size=hp["batch_size"])
+    val_loader = TemporalDataLoader(val_data, batch_size=hp["batch_size"])
 
     memory = TGNMemory(
         num_nodes,
         msg_dim,
-        MEMORY_DIM,
-        TIME_DIM,
-        message_module=IdentityMessage(msg_dim, MEMORY_DIM, TIME_DIM),
+        hp["memory_dim"],
+        hp["time_dim"],
+        message_module=IdentityMessage(msg_dim, hp["memory_dim"], hp["time_dim"]),
         aggregator_module=LastAggregator(),
     ).to(device)
 
     gnn = GraphAttentionEmbedding(
-        in_channels=MEMORY_DIM, out_channels=EMBEDDING_DIM, msg_dim=msg_dim, time_enc=memory.time_enc
+        in_channels=hp["memory_dim"],
+        out_channels=hp["embedding_dim"],
+        msg_dim=msg_dim,
+        time_enc=memory.time_enc,
+        dropout=hp["dropout"],
     ).to(device)
 
-    risk_head = RiskHead(in_channels=EMBEDDING_DIM).to(device)
+    risk_head = RiskHead(in_channels=hp["embedding_dim"]).to(device)
 
     optimizer = torch.optim.Adam(
-        set(memory.parameters()) | set(gnn.parameters()) | set(risk_head.parameters()), lr=LEARNING_RATE
+        set(memory.parameters()) | set(gnn.parameters()) | set(risk_head.parameters()), lr=hp["learning_rate"]
     )
 
-    neighbor_loader = LastNeighborLoader(num_nodes, size=NEIGHBOR_SIZE, device=device)
+    neighbor_loader = LastNeighborLoader(num_nodes, size=hp["neighbor_size"], device=device)
     assoc = torch.empty(num_nodes, dtype=torch.long, device=device)
 
     def forward_batch(batch):
@@ -191,31 +221,44 @@ def main() -> None:
 
     MLFLOW_TRACKING_DIR.mkdir(parents=True, exist_ok=True)
     mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_TRACKING_DIR / 'mlflow.db'}")
-    if mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME) is None:
+    if mlflow.get_experiment_by_name(mlflow_experiment) is None:
         mlflow.create_experiment(
-            MLFLOW_EXPERIMENT_NAME, artifact_location=(MLFLOW_TRACKING_DIR / "artifacts").as_uri()
+            mlflow_experiment, artifact_location=(MLFLOW_TRACKING_DIR / "artifacts").as_uri()
         )
-    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+    mlflow.set_experiment(mlflow_experiment)
 
+    def save_checkpoint() -> None:
+        torch.save(
+            {
+                "memory": memory.state_dict(),
+                "gnn": gnn.state_dict(),
+                "risk_head": risk_head.state_dict(),
+                "node_index": checkpoint["node_index"],
+                "neighbor_loader": {
+                    "neighbors": neighbor_loader.neighbors,
+                    "e_id": neighbor_loader.e_id,
+                    "cur_e_id": neighbor_loader.cur_e_id,
+                },
+            },
+            save_path,
+        )
+
+    val_mse, val_rho = float("nan"), float("nan")
+    best_val_rho, best_val_mse = float("-inf"), float("nan")
     with mlflow.start_run():
         mlflow.log_params(
             {
-                "label_mode": args.graph,
-                "memory_dim": MEMORY_DIM,
-                "time_dim": TIME_DIM,
-                "embedding_dim": EMBEDDING_DIM,
-                "neighbor_size": NEIGHBOR_SIZE,
-                "batch_size": BATCH_SIZE,
-                "learning_rate": LEARNING_RATE,
-                "num_epochs": NUM_EPOCHS,
+                "label_mode": graph_mode,
+                "num_epochs": epochs,
                 "loss": "unweighted_mse",
                 "num_nodes": num_nodes,
                 "train_events": train_data.src.size(0),
                 "val_events": val_data.src.size(0),
+                **hp,
             }
         )
 
-        for epoch in range(1, NUM_EPOCHS + 1):
+        for epoch in range(1, epochs + 1):
             train_loss = train_epoch()
             val_mse, val_rho = evaluate(val_loader)
             print(
@@ -226,26 +269,33 @@ def main() -> None:
             mlflow.log_metric("val_mse", val_mse, step=epoch)
             mlflow.log_metric("val_spearman", val_rho, step=epoch)
 
-        torch.save(
-            {
-                "memory": memory.state_dict(),
-                "gnn": gnn.state_dict(),
-                "risk_head": risk_head.state_dict(),
-                "node_index": checkpoint["node_index"],
-                # LastNeighborLoader is a plain class, rather than a nn.Module,
-                # so it has no state_dict() at all. Without this, Stage 3 would know each
-                # address's memory values but not who its most recent neighbors actually were,
-                # which is required by graph's attention step.
-                "neighbor_loader": {
-                    "neighbors": neighbor_loader.neighbors,
-                    "e_id": neighbor_loader.e_id,
-                    "cur_e_id": neighbor_loader.cur_e_id,
-                },
-            },
-            paths["checkpoint"],
-        )
-        mlflow.log_artifact(str(paths["checkpoint"]))
-        print(f"\nsaved checkpoint to: {paths['checkpoint']}")
+            # Checkpoint on improvement, not just at the end - a later epoch that overfits
+            # must not silently clobber the best weights seen so far.
+            if val_rho > best_val_rho:
+                best_val_rho, best_val_mse = val_rho, val_mse
+                save_checkpoint()
+                print(f"  -> new best val_spearman={val_rho:.6f}, saved checkpoint to: {save_path}")
+
+            if trial is not None:
+                trial.report(val_rho, step=epoch)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+
+        mlflow.log_artifact(str(save_path))
+
+    if device.type == "cuda":
+        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+        print(f"peak VRAM allocated: {peak_gb:.2f} GB")
+
+    return {"val_spearman": best_val_rho, "val_mse": best_val_mse, "checkpoint_path": str(save_path)}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--graph", choices=["daily", "stream"], default="stream")
+    parser.add_argument("--epochs", type=int, default=NUM_EPOCHS)
+    args = parser.parse_args()
+    run_training(graph_mode=args.graph, epochs=args.epochs)
 
 
 if __name__ == "__main__":
