@@ -1,13 +1,18 @@
-# Stage 3 app stack - demo path only (replay_producer, inference_consumer, alert_panel,
-# alert_dashboard). chain_listener.py (live feed) is deferred
+# Stage 3 app stack - two mutually exclusive event sources, selected by compose profile:
+# "replay" (replay_producer, replays a historical sample) or "live" (chain_listener, real
+# Ethereum mainnet feed via Alchemy). inference_consumer/alert_panel/alert_dashboard have no
+# profile of their own - they always start regardless of which source profile is active, since
+# both sources publish to the same Redpanda topic and inference_consumer doesn't care which one
+# produced a given event.
 #
-# Prerequisites before 'docker compose -f docker/docker-compose.app.yml --profile demo up --build':
+# Prerequisites before 'docker compose -f docker/docker-compose.app.yml --profile <replay|live> up --build':
 # 1. 'docker compose -f docker/docker-compose.infra.yml up -d' (Redpanda + Redis, separate
 #    compose project - this file does not declare depends_on them since they're not defined
 #    in this same file; Compose's depends_on only works within one file/project).
 # 2. 'uv run python scripts/fetch_artifacts.py' (downloads the large, gitignored data/
 #    files these services bind-mount below - they must exist on disk before 'up', otherwise
-#    Docker silently mounts an empty directory instead of failing loudly).
+#    Docker silently mounts an empty directory instead of failing loudly).,
+# 3. For --profile live only: ALCHEMY_API_KEY set in the project's .env (see common.py's load_dotenv)
 
 networks:
   default:
@@ -19,11 +24,21 @@ services:
     build:
       context: ..
       dockerfile: docker/producer.Dockerfile
-    profiles: ["demo"]
+    profiles: ["replay"]
     environment:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
     volumes:
       - ../data/interim:/app/data/interim:ro
+
+  chain_listener:
+    build:
+      context: ..
+      dockerfile: docker/chain_listener.Dockerfile
+    profiles: ["live"]
+    env_file:
+      - ../.env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
 
   inference_consumer:
     build:

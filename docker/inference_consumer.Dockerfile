@@ -1,4 +1,5 @@
-# inference_consumer.py's image. CPU-only torch/torch_geometric on demo purposes
+# inference_consumer.py's image. CPU-only torch/torch_geometric - a forward pass per event is
+# cheap enough that GPU wouldn't meaningfully help here, unlike training
 #
 # mlflow + scipy are listed here even though inference_consumer.py never calls them directly:
 # it imports classes from src/models/train_tgn.py, and importing that module runs its top-level
