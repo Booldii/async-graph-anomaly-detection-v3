@@ -43,6 +43,14 @@ DEFAULT_DECIMALS_FALLBACK = 18
 
 RECONNECT_BACKOFF_SECONDS = 5
 
+# Alchemy's free tier rejects eth_getLogs for ranges wider than this  - a PAYG plan
+# lifts it, but backfill() chunks regardless so it degrades gracefully either way.
+MAX_LOG_RANGE_BLOCKS = 10
+
+# websockets` own default (1 MiB) is too small for a network-wide eth_getLogs response or an
+# unusually busy block's push notification -
+MAX_WS_FRAME_BYTES = 20 * 1024 * 1024
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("chain_listener")
 
@@ -155,18 +163,25 @@ async def backfill(
     to_block = await w3.eth.block_number
     if from_block > to_block:
         return
-    logger.info("backfilling blocks %d-%d after reconnect gap...", from_block, to_block)
-    filter_params: FilterParams = {
-        "fromBlock": from_block,
-        "toBlock": to_block,
-        "topics": [TRANSFER_EVENT_TOPIC],
-    }
-    logs = await w3.eth.get_logs(filter_params)
-    for log in logs:
-        row = await normalize_log(w3, log, decimals_cache, block_ts_cache, gas_cache)
-        if row is not None:
-            await publish(producer, row)
-    logger.info("backfill done: %d logs replayed", len(logs))
+    total_logs = 0
+    # Chunked into MAX_LOG_RANGE_BLOCKS-sized windows - a single call for the whole gap would
+    # exceed Alchemy's free-tier eth_getLogs range limit as soon as the gap passes 10 blocks.
+    chunk_start = from_block
+    while chunk_start <= to_block:
+        chunk_end = min(chunk_start + MAX_LOG_RANGE_BLOCKS - 1, to_block)
+        filter_params: FilterParams = {
+            "fromBlock": chunk_start,
+            "toBlock": chunk_end,
+            "topics": [TRANSFER_EVENT_TOPIC],
+        }
+        logs = await w3.eth.get_logs(filter_params)
+        for log in logs:
+            row = await normalize_log(w3, log, decimals_cache, block_ts_cache, gas_cache)
+            if row is not None:
+                await publish(producer, row)
+        total_logs += len(logs)
+        chunk_start = chunk_end + 1
+    logger.info("backfill done: %d logs replayed", total_logs)
 
 
 async def run() -> None:
@@ -180,7 +195,9 @@ async def run() -> None:
     try:
         while True:
             try:
-                async with AsyncWeb3(WebSocketProvider(WS_URL)) as w3:
+                async with AsyncWeb3(
+                    WebSocketProvider(WS_URL, websocket_kwargs={"max_size": MAX_WS_FRAME_BYTES})
+                ) as w3:
 
                     async def handler(ctx) -> None:
                         nonlocal last_processed_block
@@ -200,9 +217,15 @@ async def run() -> None:
                     logger.info("subscribed to Transfer logs")
 
                     if last_processed_block is not None:
-                        await backfill(
-                            w3, last_processed_block, decimals_cache, block_ts_cache, gas_cache, producer
-                        )
+                        try:
+                            await backfill(
+                                w3, last_processed_block, decimals_cache, block_ts_cache, gas_cache, producer
+                            )
+                        except Exception:
+                            # A backfill failure must not tear down an otherwise healthy subscription
+                            # by falling through to the outer except below - log and keep going. Any logs
+                            # missed here are a small, bounded gap.
+                            logger.exception("backfill failed, continuing without it")
 
                     await w3.subscription_manager.handle_subscriptions(run_forever=True)
             except Exception:
