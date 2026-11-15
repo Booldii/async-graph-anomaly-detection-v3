@@ -18,6 +18,7 @@ from aiokafka import AIOKafkaProducer
 from common import KAFKA_BOOTSTRAP_SERVERS, TOPIC_TRANSFERS
 from eth_typing import ChecksumAddress
 from web3 import AsyncWeb3, WebSocketProvider
+from web3.exceptions import TimeExhausted
 from web3.types import FilterParams, LogReceipt
 
 ALCHEMY_API_KEY = os.environ["ALCHEMY_API_KEY"]
@@ -183,8 +184,21 @@ async def backfill(
         chunk_start = chunk_end + 1
     logger.info("backfill done: %d logs replayed", total_logs)
 
+def _quiet_queue_full_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """asyncio's default behavior for an exception raised inside a task's done-callback is
+    to dump a raw traceback via its own exception handler. web3.py's internal subscription queue
+    overflowing under full mainnet volume raises exactly this - asyncio.QueueFull - repeatedly while
+    we're already reconnecting."""
+    exc = context.get("exception")
+    if isinstance(exc, asyncio.QueueFull):
+        logger.warning("live feed is falling behind full mainnet volume (internal queue overflow)")
+        return
+    loop.default_exception_handler(context)
+
 
 async def run() -> None:
+    asyncio.get_running_loop().set_exception_handler(_quiet_queue_full_handler)
+
     decimals_cache = TokenDecimalsCache()
     block_ts_cache = BoundedFifoCache(maxsize=256)
     gas_cache = BoundedFifoCache(maxsize=4096)
@@ -221,6 +235,11 @@ async def run() -> None:
                             await backfill(
                                 w3, last_processed_block, decimals_cache, block_ts_cache, gas_cache, producer
                             )
+                        except (TimeExhausted, asyncio.QueueFull):
+                            # Same known overflow symptom as the outer except below
+                            logger.warning(
+                                "backfill skipped - live feed is falling behind full mainnet volume"
+                            )
                         except Exception:
                             # A backfill failure must not tear down an otherwise healthy subscription
                             # by falling through to the outer except below - log and keep going. Any logs
@@ -228,6 +247,15 @@ async def run() -> None:
                             logger.exception("backfill failed, continuing without it")
 
                     await w3.subscription_manager.handle_subscriptions(run_forever=True)
+            except (TimeExhausted, asyncio.QueueFull):
+                # The other half of the overflow symptom _quiet_queue_full_handler quiets above -
+                # this is the path where the queue backup surfaces as a stalled RPC response or
+                # a directly-propagated QueueFull.
+                logger.warning(
+                    "live feed is falling behind full mainnet volume - reconnecting in %ds...",
+                    RECONNECT_BACKOFF_SECONDS,
+                )
+                await asyncio.sleep(RECONNECT_BACKOFF_SECONDS)
             except Exception:
                 logger.exception("connection lost, reconnecting in %ds...", RECONNECT_BACKOFF_SECONDS)
                 await asyncio.sleep(RECONNECT_BACKOFF_SECONDS)
