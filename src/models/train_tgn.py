@@ -63,15 +63,16 @@ MLFLOW_EXPERIMENT_NAME = "tgn_risk_scoring"
 # also the two levers with by far the biggest VRAM impact.
 # Hardcoded hparams that gave best val results in Optuna's sweep:
 DEFAULT_HPARAMS = {
-    "memory_dim": 64,
+    "memory_dim": 80,
     "time_dim": 100,
-    "embedding_dim": 64,
-    "neighbor_size": 11,
+    "embedding_dim": 80,
+    "neighbor_size": 13,
     "batch_size": 100,
-    "learning_rate": 7.7e-4,
-    "dropout": 0.13,
+    "learning_rate": 4.332e-4,
+    "min_lr": 1e-5,
+    "dropout": 0.2675,
 }
-NUM_EPOCHS = 10
+NUM_EPOCHS = 19
 
 
 class GraphAttentionEmbedding(torch.nn.Module):
@@ -154,6 +155,9 @@ def run_training(
 
     optimizer = torch.optim.Adam(
         set(memory.parameters()) | set(gnn.parameters()) | set(risk_head.parameters()), lr=hp["learning_rate"]
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=hp["min_lr"]
     )
 
     neighbor_loader = LastNeighborLoader(num_nodes, size=hp["neighbor_size"], device=device)
@@ -258,12 +262,15 @@ def run_training(
         )
 
         for epoch in range(1, epochs + 1):
+            current_lr = optimizer.param_groups[0]["lr"]
             train_loss = train_epoch()
             val_mse, val_rho = evaluate(val_loader)
+            scheduler.step()
             print(
-                f"epoch {epoch:02d}  train_mse={train_loss:.6f}  "
+                f"epoch {epoch:02d} lr={current_lr:.6f} train_mse={train_loss:.6f}  "
                 f"val_mse={val_mse:.6f}  val_spearman={val_rho:.6f}"
             )
+            mlflow.log_metric("lr", current_lr, step=epoch)
             mlflow.log_metric("train_mse", train_loss, step=epoch)
             mlflow.log_metric("val_mse", val_mse, step=epoch)
             mlflow.log_metric("val_spearman", val_rho, step=epoch)
