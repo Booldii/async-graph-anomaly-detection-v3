@@ -23,13 +23,10 @@ from BigQuery - a deliberate, documented workaround for the lack of ground truth
 **Stage 2 - Temporal graph training.**  A Temporal Graph Network (PyTorch Geometric)
 that maintains a per-address memory vector and updates it after every token transfer, trained
 against the soft labels from Stage 1. A RiskHead decodes that memory directly into a risk score -
-no separate model on top of the embeddings. Hyperparameters are tuned via an Optuna sweep. The
-production configuration validates (time-based split, last 3 of the 14  days held out) at
-Spearman ≈0.885+ between predicted and target risk ranking.
+no separate model on top of the embeddings. Hyperparameters are tuned via an Optuna sweep.
 
 **Stage 3 - Live inference.** A stateful, event-driven service built around the
-trained TGN: new transfer events flow through a Kafka-compatible broker (Redpanda, single
-partition - TGN memory updates are order-sensitive per address) into an inference consumer that
+trained TGN: new transfer events flow through a Kafka-compatible broker into an inference consumer that
 runs each event through the model, compares the new score against the last one in Redis, and
 raises an alert when risk rises by more than a threshold. A FastAPI backend and Streamlit dashboard 
 expose the alert feed and a spike chart of recent alerts. The whole pipeline runs containerized, with
@@ -67,12 +64,52 @@ Chain Listener / Replay Producer --> Redpanda (1 partition) --> Inference Consum
   layer, and a RiskHead decoder, trained end-to-end against the Stage 1 soft labels
 - Checkpointing that preserves not just the learned weights but the full runtime memory/neighbor
   state, so inference can resume exactly where training left off
-- An Optuna sweep over memory dimension, neighbor-window size, learning rate, batch size and
-  dropout - the production default (`DEFAULT_HPARAMS` in `train_tgn.py`) uses a 64-dimensional
-  memory, picked for inference efficiency over 112/128-dim candidates that scored within ~0.5%
-  of it (see design decisions below)
-- Validation Spearman correlation ≈0.885+ for the production configuration (time-based split,
-  last 3 of 14 days held out)
+- An Optuna sweep over memory dimension, neighbor-window size, learning rate, batch size and dropout pointed out two
+  sets of hyperparametrs that brought especially good validation scores. 
+- Validation Spearman correlation ≈0.897 for both final configurations (time-based split, last 3 of 14 days held out)
+
+**Final Model Selection: The Efficiency vs Latency Trade-off**
+
+Among all Optuna sweep configurations, two hyperparameter combinations stood out during the extended 20-epoch
+training runs with learning scheduler: a lighter 80-dim architecture (memory_dim=80, neighbor_size=13)
+and a heavier 112-dim counterpart (memory_dim=112, neighbor_size=7). While both models converged to virtually identical
+validation performance (val_spearman ≈ 0.897, val_mse ≈ 0.0156), ultimately promoted the 80-dim (efficient-fox-155)
+configuration as primary production model.
+![Parameters_comp](docs/param_comparison.png)
+
+**What decided that the 80-dim model won for this project setup:**
+- Superior training stability and generalization: Despite achieving a marginally lower peak validation score than
+the 112-dim variant, the 80-dim model exhibited a noticeably smoother, monotonic training loss curve and lower
+validation variance. The smaller memory dimension acted as a natural information bottleneck, preventing the GRU
+memory updater from overfitting to local noise in the transaction stream.
+
+![lc80](docs/learning_curves80.png)
+(*Learning curves of 80/13 model*)
+
+![lc112](docs/learning_curves112.png)
+(*Learning curves of 112/7 model*)
+
+
+- 23% lower VRAM footprint: Because TGNMemory and LastNeighborLoader maintain state buffers
+for every observed node on the GPU, saving nearly 1 GB of VRAM on dev's card provides critical headroom for
+long-term graph growth as new Ethereum addresses continuously enter the stream.
+
+![bench](docs/benchmark_screenshot.png)
+(*provided by src/models/benchmark_models.py*)
+
+**Production trade-offs (memory headroom vs raw latency):**
+Because the 80-dim model aggregates a wider neighborhood window (neighbor_size=13 vs 7), its inference time
+across the validation stream was about 3% slower (34.0s vs 32.8s).
+
+This highlights an important architectural trade-off depending on deployment constraints:
+- Resource-constrained / scaling priority (this project choice): On single-GPU infrastructure with strict VRAM limits,
+  sacrificing a fraction of a millisecond per batch to free up 1 GB of memory is the safer engineering choice
+  to prevent out-of-memory crashes as the graph expands.
+
+- Ultra-low-latency priority: In an enterprise financial environment with abundant GPU memory, the 112-dim / 7-neighbor
+  configuration would likely be favored. In high-frequency financial anomaly detection and  AML risk scoring, every
+  millisecond counts, and a 3% throughput advantage combined with a slightly higher peak Spearman rank correlation
+  could easily outweigh the extra memory cost.
 
 **Stage 3 - Live inference:**
 - Two interchangeable event sources, selected via Docker Compose profiles (`make replay` /
@@ -111,16 +148,12 @@ Hub (model/data artifact hosting)
 
 ## A few design decisions worth knowing upfront
 
-- **The production TGN keeps a 64-dimensional memory, rejecting Optuna's largest candidate.** An
-  Optuna sweep over `memory_dim` found the 64-dim model within ~0.5%  validation Spearman of
-  models with roughly twice the memory (112/128) - since Stage 3 serves this model on every live event, the smaller,
-  cheaper-to-run model was kept as the production default over that marginal accuracy gain.
-- **Training runs on a 2% stratified sample of fresh EOA addresses** (`sample_fresh_addresses.py`,
-  `--fraction 0.02`), rather than the full fresh pull. A larger sample means more graph nodes, which
-  outgrows the dev GPU's 8GB VRAM budget. Sampling is stratified by activity (in-degree + out-degree, equal
-  count per quantile bucket), so the aggressive cut still keeps the full range of address activity levels represented.
 - **Scope is deliberately narrow**: only ERC-20 token transfer events, and only externally-owned accounts are scored.
   Both are documented simplifications, not gaps that were missed.
+- **Training runs on a 2% stratified sample of fresh EOA addresses** (`sample_fresh_addresses.py`,
+  `--fraction 0.02`), rather than the full fresh pull. A larger sample means more graph nodes, which
+  outgrows the dev GPU's VRAM budget. Sampling is stratified by activity (in-degree + out-degree, equal
+  count per quantile bucket), so the aggressive cut still keeps the full range of address activity levels represented.
 - **Transfer values are normalized without external price data**: a robust z-score (median/MAD of
   the log value), computed separately per token contract. This is self-referential - recomputed
   from whatever data is on hand rather than relying on a maintained price list - so it's resilient
@@ -268,17 +301,15 @@ pobieranych na żywo z BigQuery - to świadome, udokumentowane obejście braku d
 Graph Network, PyTorch Geometric), która utrzymuje wektor pamięci per adres i aktualizuje go po
 każdym transferze tokena, trenowana względem miękkich etykiet z Etapu 1. RiskHead dekoduje tę
 pamięć bezpośrednio na wynik ryzyka - bez dodatkowego modelu nad embeddingami. Hiperparametry są
-dotuningowane przeszukiwaniem Optuna. Konfiguracja produkcyjna osiąga  walidacyjną (podział czasowy,
-ostatnie 3 z 14 dni odłożone) korelację Spearmana ≈0,885+ między przewidywanym a docelowym rankingiem ryzyka.
+dotuningowane przeszukiwaniem Optuna.
 
 **Etap 3 - Inferencja na żywo.**  Stanowa, sterowana zdarzeniami usługa zbudowana wokół
-wytrenowanego TGN: nowe zdarzenia transferu wpadają przez broker kompatybilny z Kafką (Redpanda,
-jedna partycja - pamięć TGN jest stanowa i wymaga zachowania kolejności per adres) do konsumenta
+wytrenowanego TGN: nowe zdarzenia transferu wpadają przez broker kompatybilny z Kafką do konsumenta
 inferencyjnego, który przepuszcza każde zdarzenie przez model, porównuje nowy wynik z ostatnim
 zapisanym w Redis i generuje alert, gdy ryzyko wzrasta o więcej niż próg . Backend FastAPI i
 dashboard w Streamlicie udostępniają listę alertów i  wykres "spike'ów" ostatnich alertów. Cały
-pipeline działa skonteneryzowany, z dwoma wymiennymi źródłami zdarzeń (patrz Szybki start
-poniżej): `make replay` odtwarza nagraną historyczną próbkę - bez potrzeby klucza API - albo
+pipeline działa skonteneryzowany, z dwoma wymiennymi źródłami zdarzeń: `make replay` odtwarza
+nagraną historyczną próbkę - bez potrzeby klucza API - albo
 `make live` podłącza się do żywego feedu mainnet Ethereum przez Alchemy (wystarczy darmowe konto).
 
 ```
@@ -312,12 +343,52 @@ Chain Listener / Replay Producer --> Redpanda (1 partycja) --> Inference Consume
   dekoderem RiskHead, trenowana end-to-end względem miękkich etykiet z Etapu 1
 - Checkpointing zachowujący nie tylko wyuczone wagi, ale cały stan pamięci/sąsiadów w czasie
   działania, dzięki czemu inferencja może kontynuować dokładnie tam, gdzie skończył się trening
-- Przeszukiwanie hiperparametrów Optuną (wymiar pamięci, rozmiar okna sąsiadów, learning rate,
-  batch size, dropout) - domyślna konfiguracja produkcyjna (`DEFAULT_HPARAMS` w `train_tgn.py`)
-  używa 64-wymiarowej pamięci, wybranej ze względu na efektywność inferencji, mimo że kandydaci
-  o 112/128 wymiarach osiągnęli wynik lepszy tylko o ~0,5% (patrz decyzje projektowe poniżej)
-- Korelacja Spearmana na walidacji ≈0,885+ dla konfiguracji produkcyjnej (podział czasowy,
-  ostatnie 3 z 14 dni odłożone)
+- Przeszukiwanie hiperparametrów Optuną (wymiar pamięci, rozmiar okna sąsiadów, learning rate, batch size,
+  dropout) wskazało dwa zestawy hiperparametrów, które dały szczególnie dobre wyniki walidacyjne.
+- Korelacja Spearmana na walidacji ≈0,897 dla obu finalnych konfiguracji (podział czasowy, ostatnie 3 z 14 dni odłożone)
+
+**Wybór finalnego modelu: trade-off efektywność vs latencja**
+
+Spośród wszystkich konfiguracji z przeszukiwania Optuną dwie kombinacje hiperparametrów wyróżniły się podczas
+rozszerzonych 20-epokowych przebiegów treningowych z learning rate schedulerem: lżejsza architektura 80-wymiarowa
+(memory_dim=80, neighbor_size=13) i cięższy odpowiednik 112-wymiarowy (memory_dim=112, neighbor_size=7). Mimo że
+oba modele zbiegły do praktycznie identycznej skuteczności walidacyjnej (val_spearman ≈ 0,897, val_mse ≈ 0,0156),
+do produkcji ostatecznie wybrano konfigurację 80-wymiarową (efficient-fox-155).
+![Parameters_comp](docs/param_comparison.png)
+
+**Co zdecydowało, że model 80-wymiarowy wygrał w tym projekcie:**
+- Lepsza stabilność treningu i generalizacja: mimo osiągnięcia nieznacznie niższego szczytowego wyniku walidacyjnego
+niż wariant 112-wymiarowy, model 80-wymiarowy miał wyraźnie gładszą, monotoniczną krzywą straty treningowej i niższą
+wariancję walidacyjną. Mniejszy wymiar pamięci działał jak naturalny bottleneck informacyjny, zapobiegając
+przeuczeniu modułu pamięci GRU na lokalny szum w strumieniu transakcji.
+
+![lc80](docs/learning_curves80.png)
+(*Krzywe uczenia modelu 80/13*)
+
+![lc112](docs/learning_curves112.png)
+(*Krzywe uczenia modelu 112/7*)
+
+
+- 23% niższe zużycie VRAM: ponieważ TGNMemory i LastNeighborLoader utrzymują bufory stanu dla każdego
+obserwowanego węzła na GPU, zaoszczędzenie blisko 1 GB VRAM na karcie deweloperskiej daje istotny zapas na
+długoterminowy wzrost grafu, gdy do strumienia nieprzerwanie dołączają nowe adresy Ethereum.
+
+![bench](docs/benchmark_screenshot.png)
+(*Benchmark wykonano przez src/models/benchmark_models.py*)
+
+**Trade-offy produkcyjne (zapas pamięci vs surowa latencja):**
+Ponieważ model 80-wymiarowy agreguje szersze okno sąsiedztwa (neighbor_size=13 vs 7), jego czas inferencji na
+całym strumieniu walidacyjnym był o ok. 3% wolniejszy (34,0s vs 32,8s).
+
+To podkreśla istotny architektoniczny trade-off, zależny od ograniczeń wdrożenia:
+- Priorytet zasobowy / skalowania (wybór w tym projekcie): na infrastrukturze z jednym GPU i ścisłymi limitami
+  VRAM, poświęcenie ułamka milisekundy na batch w zamian za uwolnienie 1 GB pamięci jest bezpieczniejszą decyzją
+  inżynierską, zapobiegającą awariom OOM przy dalszym wzroście grafu.
+
+- Priorytet ultra-niskiej latencji: w środowisku korporacyjnym/finansowym z dużymi zasobami pamięci GPU, konfiguracja
+  112-wymiarowa / 7 sąsiadów byłaby prawdopodobnie preferowana. W wykrywaniu anomalii finansowych o wysokiej
+  częstotliwości i ocenie ryzyka AML liczy się każda milisekunda, a 3% przewaga przepustowości w połączeniu z
+  nieco wyższą szczytową korelacją Spearmana mogłyby z łatwością przeważyć nad dodatkowym kosztem pamięci.
 
 **Etap 3 - Inferencja na żywo:**
 - Dwa wymienne źródła zdarzeń, wybierane przez profile Docker Compose (`make replay` / `make
@@ -357,19 +428,14 @@ Compose - Hugging Face Hub (hosting artefaktów modelu/danych)
 
 ## Kilka decyzji projektowych, które warto znać od początku
 
-- **Produkcyjny TGN zachowuje 64-wymiarową pamięć kosztem najlepszego kandydata z Optuny.**
-  Przeszukiwanie Optuną wymiaru pamięci (64/80/100/112/128) wykazało, że model 64-wymiarowy
-  wypadł zaledwie ~0,5% gorzej walidacyjnie niż modele o dwukrotnie większej pamięci (112/128) -
-  skoro Etap 3 serwuje ten model na żywo dla każdego zdarzenia, mniejszy, tańszy w inferencji
-  model został wybrany jako domyślny produkcyjny kosztem tego minimalnego zysku dokładności.
+- **Zakres jest celowo wąski**: uwzględniane są wyłącznie zdarzenia transferów tokenów ERC-20 i oceniane są tylko
+  konta zewnętrzne (EOA). Oba te uproszczenia są udokumentowane - to nie przeoczone luki.
 - **Trening odbywa się na 2% stratyfikowanej próbce świeżych adresów EOA**
   (`sample_fresh_addresses.py`, `--fraction 0.02`), nie na całym świeżym pociągnięciu danych.
-  Większa próbka to więcej węzłów grafu, co wychodzi poza budżet 8GB VRAM dev-owego GPU. 
+  Większa próbka to więcej węzłów grafu, co wychodzi poza budżet VRAM dev-owego GPU. 
   Próbkowanie jest stratyfikowane po aktywności (in-degree + out-degree, równa liczba
   adresów per kwantylowy koszyk) - dzięki temu mimo agresywnego obcięcia cała
   rozpiętość poziomów aktywności adresów zostaje zachowana w próbce.
-- **Zakres jest celowo wąski**: uwzględniane są wyłącznie zdarzenia transferów tokenów ERC-20 i oceniane są tylko
-  konta zewnętrzne (EOA). Oba te uproszczenia są udokumentowane - to nie przeoczone luki.
 - **Wartości transferów są normalizowane bez zewnętrznych danych cenowych**: stosowany jest odporny z-score (mediana/MAD
   logarytmu wartości), liczony osobno dla każdego kontraktu tokena. Jest to podejście samoodniesieniowe - wyliczane
   na nowo z dostępnych danych zamiast polegania na utrzymywanej liście cen - dzięki czemu jest odporne
